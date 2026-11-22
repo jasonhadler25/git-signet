@@ -2,7 +2,7 @@
 //!
 //! Encoding follows the exact canonical unpadded lowercase RFC 4648 base32 rules of `hashset`:
 //! - Alphabet: `[a-z2-7]` (32 symbols, 5 bits each).
-//! - 32-byte Ed25519 public key -> 52 characters (260 bits; bottom 4 padding bits MUST be 0,
+//! - 32-byte Ed25519 verifying key -> 52 characters (260 bits; bottom 4 padding bits MUST be 0,
 //!   so the 52nd character MUST be `'a'` (0b00000) or `'q'` (0b10000)).
 //! - Total marker length: 60 ASCII characters (`ed25519-` + 52 base32 chars), strictly in `[a-z0-9-]`.
 
@@ -15,7 +15,7 @@ pub const OPENSSH_ED25519_WIRE_PREFIX: &[u8; 19] = b"\x00\x00\x00\x0bssh-ed25519
 const B32_ALPHA: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Encode a 32-byte Ed25519 public key as canonical 52-char unpadded lowercase RFC 4648 base32.
+/// Encode a 32-byte Ed25519 verifying key as canonical 52-char unpadded lowercase RFC 4648 base32.
 pub fn encode_base32_key(key: &PubKey32) -> String {
     let mut out = String::with_capacity(KEY_B32_LEN);
     let mut bit_buf: u32 = 0;
@@ -37,7 +37,7 @@ pub fn encode_base32_key(key: &PubKey32) -> String {
     out
 }
 
-/// Strictly decode a canonical 52-char unpadded lowercase RFC 4648 base32 Ed25519 public key.
+/// Strictly decode a canonical 52-char unpadded lowercase RFC 4648 base32 Ed25519 verifying key.
 /// Rejects uppercase, padding `=`, wrong length, non-base32 chars, and non-zero trailing pad bits.
 pub fn decode_base32_key(s: &str) -> Result<PubKey32, String> {
     let bytes = s.as_bytes();
@@ -161,13 +161,13 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Parse an OpenSSH `ssh-ed25519 <base64> [comment]` public key line into its raw 32-byte key.
+/// Parse an OpenSSH `ssh-ed25519 <base64> [comment]` `.pub` line into the raw 32-byte verifying key.
 pub fn parse_openssh_ed25519_pubkey(line: &str) -> Result<PubKey32, String> {
     let trimmed = line.trim();
     let mut parts = trimmed.split_whitespace();
     let key_type = parts
         .next()
-        .ok_or_else(|| "empty OpenSSH public key".to_string())?;
+        .ok_or_else(|| "empty OpenSSH key line".to_string())?;
     if key_type != "ssh-ed25519" {
         return Err(format!(
             "unsupported SSH key type {key_type:?}; git-signet requires ssh-ed25519"
@@ -175,7 +175,7 @@ pub fn parse_openssh_ed25519_pubkey(line: &str) -> Result<PubKey32, String> {
     }
     let b64 = parts
         .next()
-        .ok_or_else(|| "missing base64 key blob in OpenSSH public key".to_string())?;
+        .ok_or_else(|| "missing base64 key blob in OpenSSH key line".to_string())?;
     let wire = base64_decode(b64)?;
     if wire.len() != 51 || !wire.starts_with(OPENSSH_ED25519_WIRE_PREFIX) {
         return Err(format!(
@@ -188,7 +188,7 @@ pub fn parse_openssh_ed25519_pubkey(line: &str) -> Result<PubKey32, String> {
     Ok(key)
 }
 
-/// Format a raw 32-byte Ed25519 public key as an OpenSSH `allowed_signers` line for principal `principal`.
+/// Format a raw 32-byte Ed25519 verifying key as an OpenSSH `allowed_signers` line for principal `principal`.
 pub fn format_allowed_signers_line(principal: &str, key: &PubKey32) -> String {
     let mut wire = [0u8; 51];
     wire[..19].copy_from_slice(OPENSSH_ED25519_WIRE_PREFIX);
@@ -208,14 +208,6 @@ pub fn format_allowed_signers_line(principal: &str, key: &PubKey32) -> String {
 ///
 /// Fails closed (`Err`) on any malformed `ed25519-` token or multiple conflicting keys.
 pub fn extract_key_from_refname(refname: &str) -> Result<Option<PubKey32>, String> {
-    // Reject revision traversal syntax attached to a key-bearing expression (same discipline as git-buttress M3)
-    if refname.contains("ed25519-")
-        && (refname.contains('^') || refname.contains('~') || refname.contains(".."))
-    {
-        return Err(format!(
-            "ambiguous revision walk operator on ed25519-pinned ref {refname:?}"
-        ));
-    }
     let mut found: Option<PubKey32> = None;
     for seg in refname.split('/') {
         if let Some(k) = extract_key_from_segment(seg, true)? {
@@ -226,6 +218,13 @@ pub fn extract_key_from_refname(refname: &str) -> Result<Option<PubKey32>, Strin
             }
             found = Some(k);
         }
+    }
+    if found.is_some()
+        && (refname.contains('^') || refname.contains('~') || refname.contains(".."))
+    {
+        return Err(format!(
+            "ambiguous revision walk operator on ed25519-pinned ref {refname:?}"
+        ));
     }
     Ok(found)
 }
@@ -262,37 +261,50 @@ pub fn extract_key_from_remote_url(url: &str) -> Result<Option<PubKey32>, String
 }
 
 fn extract_key_from_segment(seg: &str, allow_plus: bool) -> Result<Option<PubKey32>, String> {
-    if !seg.contains(MARKER_PREFIX) {
-        return Ok(None);
-    }
-    // Scan every occurrence of `ed25519-` delimited by start-of-segment, `.`, or `+`
+    // `ed25519-` begins a key marker only at the start of the segment or after `.` (or `+` in ref
+    // names), and only when exactly 52 base32 characters follow. Anything else containing
+    // `ed25519-` (a repository called `ed25519-dalek`, a branch called `fix/ed25519-parsing`) is an
+    // ordinary name. A token that is nearly a key (40 or more letters and digits) is rejected as
+    // damaged, so that a key mangled in copying fails loudly instead of switching verification off.
+    let is_delim = |c: char| c == '.' || (allow_plus && c == '+');
+    let is_b32 = |c: char| c.is_ascii_lowercase() || ('2'..='7').contains(&c);
     let mut found: Option<PubKey32> = None;
-    let bytes = seg.as_bytes();
     let mut search_from = 0usize;
     while let Some(rel) = seg[search_from..].find(MARKER_PREFIX) {
         let pos = search_from + rel;
-        let valid_before = pos == 0
-            || bytes[pos - 1] == b'.'
-            || (allow_plus && bytes[pos - 1] == b'+');
-        if !valid_before {
+        search_from = pos + MARKER_PREFIX.len();
+        if pos != 0 && !seg[..pos].ends_with(is_delim) {
+            continue;
+        }
+        let after = &seg[search_from..];
+        let token = &after[..after
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after.len())];
+        let next = after[token.len()..].chars().next();
+        let ends_cleanly = next.is_none_or(is_delim);
+        if token.len() == KEY_B32_LEN && token.chars().all(is_b32) {
+            if matches!(next, Some('~' | '^' | '@' | ':')) {
+                return Err(format!(
+                    "ambiguous revision walk operator on ed25519-pinned ref {seg:?}"
+                ));
+            }
+            if !ends_cleanly {
+                continue;
+            }
+            let k = decode_base32_key(token)
+                .map_err(|e| format!("invalid ed25519 key marker in {seg:?}: {e}"))?;
+            if let Some(prev) = found
+                && prev != k
+            {
+                return Err(format!("conflicting ed25519 keys in {seg:?}"));
+            }
+            found = Some(k);
+        } else if token.len() >= 40 && ends_cleanly {
             return Err(format!(
-                "malformed ed25519 key marker in {seg:?}: must follow start, '.', or '+'"
+                "damaged ed25519 key marker in {seg:?}: expected {KEY_B32_LEN} lowercase base32 characters, found {}",
+                token.len()
             ));
         }
-        let after = &seg[pos + MARKER_PREFIX.len()..];
-        let end_rel = after
-            .find(|c| c == '.' || (allow_plus && c == '+'))
-            .unwrap_or(after.len());
-        let token = &after[..end_rel];
-        let k = decode_base32_key(token)
-            .map_err(|e| format!("invalid ed25519 key marker in {seg:?}: {e}"))?;
-        if let Some(prev) = found
-            && prev != k
-        {
-            return Err(format!("conflicting ed25519 keys in {seg:?}"));
-        }
-        found = Some(k);
-        search_from = pos + MARKER_PREFIX.len() + end_rel;
     }
     Ok(found)
 }
@@ -358,9 +370,19 @@ mod tests {
             .unwrap(),
             Some(k)
         );
-        // Malformed marker fails closed
-        assert!(extract_key_from_refname("refs/heads/main+ed25519-short").is_err());
-        assert!(extract_key_from_remote_url("https://github.com/maya/acme.ed25519-bad").is_err());
+        // Ordinary names that merely contain `ed25519-` are not keys
+        for url in [
+            "https://github.com/dalek-cryptography/ed25519-dalek.git",
+            "https://github.com/maya/acme.ed25519-bad",
+            "git@github.com:x/libed25519-donna.git",
+        ] {
+            assert_eq!(extract_key_from_remote_url(url).unwrap(), None, "{url}");
+        }
+        assert_eq!(extract_key_from_refname("refs/heads/fix/ed25519-parsing").unwrap(), None);
+        assert_eq!(extract_key_from_refname("refs/heads/main+ed25519-short~1").unwrap(), None);
+        // A key damaged in copying (one character short, or uppercased) fails loudly
+        assert!(extract_key_from_refname(&format!("refs/heads/main+{}", &m[..m.len() - 1])).is_err());
+        assert!(extract_key_from_remote_url(&format!("https://h/acme.ed25519-{}", m[8..].to_uppercase())).is_err());
         // Walk syntax rejected
         assert!(extract_key_from_refname(&format!("main+{m}~1")).is_err());
     }

@@ -54,19 +54,7 @@ def extract_tag_sig(raw):
         raise ValueError("tag has no SSH signature")
     return raw[:idx + 1], raw[idx + 1:]
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: signet-verify.py <rev> <ed25519-52-base32>")
-    pub = decode_marker(sys.argv[2])
-    oid = git("rev-parse", "--verify", "--end-of-options", sys.argv[1]).decode().strip()
-    kind = git("cat-file", "-t", oid).decode().strip()
-    raw = git("cat-file", kind, oid)
-    if kind == "commit":
-        payload, sig = extract_commit_sig(raw)
-    elif kind == "tag":
-        payload, sig = extract_tag_sig(raw)
-    else:
-        raise SystemExit(f"cannot verify signature on Git {kind}")
+def good(pub, payload, sig):
     with tempfile.TemporaryDirectory() as td:
         allowed = os.path.join(td, "allowed")
         sigf = os.path.join(td, "sig")
@@ -76,6 +64,29 @@ if __name__ == "__main__":
             ["ssh-keygen", "-Y", "verify", "-f", allowed, "-I", "git-signet", "-n", "git", "-s", sigf],
             input=payload, capture_output=True
         )
-        if r.returncode != 0 or not r.stdout.startswith(b'Good "git" signature for git-signet with ED25519 key '):
-            raise SystemExit(f"INVALID: {(r.stderr or r.stdout).decode().strip()}")
-    print(f"GOOD {kind} {oid} signed by {sys.argv[2]}")
+        return r.returncode == 0 and r.stdout.startswith(b'Good "git" signature for git-signet with ED25519 key ')
+
+def signed_by(pub, oid):
+    """A commit signed by the key; or a tag signed by it, or naming a commit that is."""
+    kind = git("cat-file", "-t", oid).decode().strip()
+    raw = git("cat-file", kind, oid)
+    try:
+        if kind == "commit":
+            return good(pub, *extract_commit_sig(raw))
+        if kind == "tag" and good(pub, *extract_tag_sig(raw)):
+            return True
+    except ValueError:
+        pass
+    if kind != "tag":
+        return False
+    commit = git("rev-parse", "--verify", "--end-of-options", oid + "^{commit}").decode().strip()
+    return signed_by(pub, commit)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: signet-verify.py <rev> <ed25519-52-base32>")
+    pub = decode_marker(sys.argv[2])
+    oid = git("rev-parse", "--verify", "--end-of-options", sys.argv[1]).decode().strip()
+    if not signed_by(pub, oid):
+        raise SystemExit(f"NOT signed by {sys.argv[2]}: {oid}")
+    print(f"GOOD {oid} signed by {sys.argv[2]}")

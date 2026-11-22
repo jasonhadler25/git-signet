@@ -51,6 +51,7 @@ impl Sandbox {
             .env("GIT_AUTHOR_EMAIL", "tester@example.com")
             .env("GIT_COMMITTER_NAME", "Tester")
             .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+            .env("GIT_EDITOR", "true")
             .args(args)
             .output()
             .unwrap()
@@ -240,28 +241,32 @@ fn branch_and_tag_keys_unsigned_tag_rejection_and_conflict_checks() {
     fs::write(repo.join("hello.txt"), "signed on self-certifying branch\n").unwrap();
     assert!(sb.git(&repo, &["add", "hello.txt"]).status.success());
 
-    // Attempting an unsigned commit on `main+ed25519-...` MUST be blocked immediately!
-    let bad_commit = sb.git(&repo, &["commit", "--no-gpg-sign", "-m", "Oops unsigned"]);
-    assert!(
-        !bad_commit.status.success(),
-        "unsigned commit on key-pinned branch must fail closed!"
-    );
+    // A local commit is never refused, signed or not: local branches are the user's own work.
+    // What the key's name promises is checked when the branch is fetched, and on request.
+    assert!(sb.git(&repo, &["commit", "--no-gpg-sign", "-m", "Unsigned local work"]).status.success());
+    assert!(!sb.signet(&repo, &["check", "HEAD"]).status.success(), "unsigned tip must not check out as signed");
+    fs::write(repo.join("hello.txt"), "now signed\n").unwrap();
+    assert!(sb.git(&repo, &["commit", "-am", "Signed commit on branch"]).status.success());
+    assert!(sb.signet(&repo, &["check", "HEAD"]).status.success());
 
-    // Signed commit succeeds!
-    assert!(sb.git(&repo, &["commit", "-m", "Signed commit on branch"]).status.success());
-
-    // Signed annotated tag carrying key passes!
+    // A signed annotated tag whose name carries the key passes.
     let good_tag = format!("v1.0.0+{maya_marker}");
     assert!(sb.git(&repo, &["tag", "-s", &good_tag, "-m", "Signed tag"]).status.success());
     assert!(sb.signet(&repo, &["check", &good_tag]).status.success());
 
-    // UNSIGNED annotated tag pointing to a SIGNED commit MUST FAIL CLOSED!
-    let bad_tag = format!("v2.0.0+{maya_marker}");
-    let bad_tag_res = sb.git(&repo, &["tag", "-a", "--no-sign", &bad_tag, "-m", "Unsigned tag"]);
+    // So does a plain annotated tag naming a signed commit: the commit carries the signature.
+    let plain_tag = format!("v2.0.0+{maya_marker}");
+    assert!(sb.git(&repo, &["tag", "-a", "--no-sign", &plain_tag, "-m", "Plain tag"]).status.success());
+
+    // A tag whose name carries the key but which names an unsigned commit is refused.
+    assert!(sb.git(&repo, &["checkout", "-q", "--detach"]).status.success());
+    assert!(sb.git(&repo, &["commit", "--no-gpg-sign", "--allow-empty", "-m", "unsigned"]).status.success());
+    let bad_tag = format!("v3.0.0+{maya_marker}");
     assert!(
-        !bad_tag_res.status.success(),
-        "unsigned annotated tag carrying ed25519 key MUST fail closed even when commit is signed!"
+        !sb.git(&repo, &["tag", "-a", "--no-sign", &bad_tag, "-m", "x"]).status.success(),
+        "a key-named tag on an unsigned commit must be refused"
     );
+    assert!(sb.git(&repo, &["checkout", "-q", &branch]).status.success());
 
     // Push to ordinary remote and verify clone works with `-b main+ed25519-...`
     assert!(sb.git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
@@ -363,4 +368,98 @@ fn composes_cleanly_with_git_buttress_when_installed() {
     let sam_evil = sb.root.join("sam-evil");
     let blocked = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam_evil.to_str().unwrap()]);
     assert!(!blocked.status.success(), "git-signet MUST block Mallory's validly-buttressed commit!");
+}
+
+fn head_is_signed(sb: &Sandbox, repo: &Path) -> bool {
+    String::from_utf8_lossy(&sb.git(repo, &["cat-file", "commit", "HEAD"]).stdout)
+        .contains("gpgsig -----BEGIN SSH SIGNATURE-----")
+}
+
+#[test]
+fn key_holders_sign_without_setup_and_nobody_elses_commits_are_refused() {
+    // Two people on two machines: Maya holds the signing key, Sam does not.
+    let m = Sandbox::new();
+    let s = Sandbox::new();
+    let (maya_key, marker) = m.gen_ed25519("maya_key");
+    assert!(m.signet(&m.root, &["adopt", maya_key.to_str().unwrap()]).status.success());
+    assert!(m.signet(&m.root, &["enable", "--global"]).status.success());
+    assert!(s.signet(&s.root, &["enable", "--global"]).status.success());
+
+    // --- A repository whose name carries the key: Maya types only plain git. ---
+    let remote = m.root.join(format!("acme.{marker}.git"));
+    assert!(m.git(&m.root, &["init", "--bare", "-b", "main", remote.to_str().unwrap()]).status.success());
+    let work = m.root.join("work");
+    assert!(m.git(&m.root, &["init", "-b", "main", work.to_str().unwrap()]).status.success());
+    assert!(m.git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
+    fs::write(work.join("f"), "one\n").unwrap();
+    assert!(m.git(&work, &["add", "f"]).status.success());
+    assert!(m.git(&work, &["commit", "-m", "one"]).status.success());
+    assert!(head_is_signed(&m, &work), "the key holder's plain `git commit` must be signed");
+    assert!(m.git(&work, &["tag", "-a", "v1", "-m", "ordinary annotated tag"]).status.success());
+    assert!(m.git(&work, &["tag", "light"]).status.success());
+    let pushed = m.git(&work, &["push", "-u", "origin", "main", "--tags"]);
+    assert!(pushed.status.success(), "push failed: {pushed:?}");
+
+    // --- Sam clones, works, and merges Maya's next commit. Nothing refuses his own commits. ---
+    let sam = s.root.join("sam");
+    let cloned = s.git(&s.root, &["clone", remote.to_str().unwrap(), sam.to_str().unwrap()]);
+    assert!(cloned.status.success(), "clone failed: {cloned:?}");
+    fs::write(sam.join("sam.txt"), "sam's work\n").unwrap();
+    assert!(s.git(&sam, &["add", "sam.txt"]).status.success());
+    let sam_commit = s.git(&sam, &["commit", "-m", "Sam's local work"]);
+    assert!(sam_commit.status.success(), "a local commit without the key must succeed: {sam_commit:?}");
+    assert!(!head_is_signed(&s, &sam));
+    fs::write(work.join("f"), "two\n").unwrap();
+    assert!(m.git(&work, &["commit", "-am", "two"]).status.success());
+    assert!(m.git(&work, &["push", "origin", "main"]).status.success());
+    let pulled = s.git(&sam, &["pull", "--no-rebase", "--no-edit"]);
+    assert!(pulled.status.success(), "pull with a local merge must succeed: {pulled:?}");
+    assert!(s.signet(&sam, &["fsck"]).status.success());
+
+    // If Sam's unsigned merge is pushed to the keyed repository, everyone's next clone refuses it.
+    let _ = s.git(&sam, &["push", "origin", "main"]);
+    let later = s.root.join("later");
+    let refused = s.git(&s.root, &["clone", remote.to_str().unwrap(), later.to_str().unwrap()]);
+    assert!(!refused.status.success(), "an unsigned tip in the keyed repository must be refused");
+
+    // --- A branch whose name carries the key, in a brand-new repository. ---
+    let branch = format!("main+{marker}");
+    let b = m.root.join("b");
+    assert!(m.git(&m.root, &["init", "-b", &branch, b.to_str().unwrap()]).status.success());
+    fs::write(b.join("a"), "base\n").unwrap();
+    assert!(m.git(&b, &["add", "a"]).status.success());
+    assert!(m.git(&b, &["commit", "-m", "base"]).status.success());
+    assert!(head_is_signed(&m, &b), "the first commit on an unborn key-named branch must be signed");
+
+    // A rebase that stops for a conflict leaves HEAD detached; continuing must still sign.
+    assert!(m.git(&b, &["switch", "-c", "side"]).status.success());
+    fs::write(b.join("a"), "side\n").unwrap();
+    assert!(m.git(&b, &["commit", "-am", "side"]).status.success());
+    assert!(m.git(&b, &["switch", &branch]).status.success());
+    fs::write(b.join("a"), "mine\n").unwrap();
+    assert!(m.git(&b, &["commit", "-am", "mine"]).status.success());
+    assert!(!m.git(&b, &["rebase", "side"]).status.success(), "the rebase should stop on a conflict");
+    fs::write(b.join("a"), "resolved\n").unwrap();
+    assert!(m.git(&b, &["add", "a"]).status.success());
+    let cont = m.git(&b, &["rebase", "--continue"]);
+    assert!(cont.status.success(), "rebase --continue failed: {cont:?}");
+    assert!(head_is_signed(&m, &b), "the rebased tip must be signed");
+    assert!(m.signet(&b, &["check", "HEAD"]).status.success());
+
+    // Sam, without the key, can still commit on a branch of that name; it just is not signed.
+    let sb = s.root.join("b");
+    assert!(s.git(&s.root, &["init", "-b", &branch, sb.to_str().unwrap()]).status.success());
+    fs::write(sb.join("a"), "sam\n").unwrap();
+    assert!(s.git(&sb, &["add", "a"]).status.success());
+    assert!(s.git(&sb, &["commit", "-m", "sam"]).status.success());
+    assert!(!s.signet(&sb, &["check", "HEAD"]).status.success());
+
+    // A repository that merely has `ed25519-` in its name is an ordinary repository.
+    let dalek = s.root.join("dalek");
+    assert!(s.git(&s.root, &["init", "-b", "main", dalek.to_str().unwrap()]).status.success());
+    assert!(s.git(&dalek, &["remote", "add", "origin", "https://example.com/x/ed25519-dalek.git"]).status.success());
+    fs::write(dalek.join("a"), "a\n").unwrap();
+    assert!(s.git(&dalek, &["add", "a"]).status.success());
+    assert!(s.git(&dalek, &["commit", "-m", "a"]).status.success());
+    assert!(s.git(&dalek, &["switch", "-c", "fix/ed25519-parsing"]).status.success());
 }

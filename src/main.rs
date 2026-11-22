@@ -1,6 +1,7 @@
 use git_signet::git::{
-    GitRepo, configure_signing_here, disable_signet, enable_signet, fsck_all_refs,
-    run_reference_transaction_hook, sanitize_for_tty, verify_object_signature,
+    GitRepo, adopt_signing_key, configure_signing_here, disable_signet, enable_signet,
+    fsck_all_refs, governing_key, run_reference_transaction_hook, sanitize_for_tty,
+    unadopt_signing_key, verify_object_signature,
 };
 use git_signet::key::{format_marker, parse_marker, parse_openssh_ed25519_pubkey};
 use std::env;
@@ -9,14 +10,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
-git-signet — Zero-PKI self-certifying Ed25519 signing keys in Git repo, branch, and tag names
+git-signet — Ed25519 verifying keys carried in Git repository, branch, and tag names
 
 USAGE:
-  git signet enable [--global | --local]
+  git signet enable [--global | --local]       check signatures on clone, fetch and pull
   git signet disable [--global | --local]
   git signet keygen [--file <path>] [--comment <text>]
-  git signet format-key <pubkey.pub>
-  git signet sign-here <private-key-path>
+                                               make a signing key and adopt it
+  git signet adopt <signing-key>               sign automatically wherever a name carries this key
+  git signet unadopt <signing-key>
+  git signet format-key <key.pub>              print a key's ed25519-<52-base32> marker
+  git signet sign-here <signing-key>           sign every commit in this one repository
   git signet check [<rev>] [--key ed25519-<52-base32>]
   git signet fsck
   git signet version
@@ -38,6 +42,8 @@ fn main() -> ExitCode {
         "disable" => cmd_disable(&args[1..]),
         "keygen" => cmd_keygen(&args[1..]),
         "format-key" => cmd_format_key(&args[1..]),
+        "adopt" => cmd_adopt(&args[1..], true),
+        "unadopt" => cmd_adopt(&args[1..], false),
         "sign-here" => cmd_sign_here(&args[1..]),
         "check" | "verify" => cmd_check(&args[1..]),
         "fsck" => cmd_fsck(&args[1..]),
@@ -150,19 +156,38 @@ fn cmd_keygen(args: &[String]) -> Result<i32, String> {
     }
     let pub_txt = fs::read_to_string(&pub_path)
         .map_err(|e| format!("read {}: {e}", pub_path.display()))?;
-    let k = parse_openssh_ed25519_pubkey(&pub_txt)?;
-    let marker = format_marker(&k);
-    println!("Key file:    {}", key_path.display());
-    println!("Signet ID:   {marker}");
-    println!("Repo suffix: <repo>.{marker}");
-    println!("Branch name: main+{marker}");
-    println!("Tag name:    v1.0.0+{marker}");
+    parse_openssh_ed25519_pubkey(&pub_txt)?;
+    let k = adopt_signing_key(&key_path)?;
+    print_adopted(&key_path, &format_marker(&k));
+    Ok(0)
+}
+
+fn print_adopted(key_path: &Path, marker: &str) {
+    println!("Signing key:   {}", key_path.display());
+    println!("Verifying key: {marker}");
+    println!("Name a repository  <repo>.{marker}");
+    println!("or a branch        main+{marker}");
+    println!("and plain `git commit` there signs with this key; nothing else to set up.");
+}
+
+fn cmd_adopt(args: &[String], adopt: bool) -> Result<i32, String> {
+    let [path] = args else {
+        return Err("usage: git signet adopt|unadopt <signing-key>".into());
+    };
+    let path = Path::new(path);
+    if adopt {
+        let k = adopt_signing_key(path)?;
+        print_adopted(path, &format_marker(&k));
+    } else {
+        let k = unadopt_signing_key(path)?;
+        println!("No longer signing automatically with {}", format_marker(&k));
+    }
     Ok(0)
 }
 
 fn cmd_format_key(args: &[String]) -> Result<i32, String> {
     if args.len() != 1 {
-        return Err("usage: git signet format-key <pubkey.pub>".into());
+        return Err("usage: git signet format-key <key.pub>".into());
     }
     let pub_txt = fs::read_to_string(&args[0])
         .map_err(|e| format!("read {}: {e}", args[0]))?;
@@ -173,11 +198,11 @@ fn cmd_format_key(args: &[String]) -> Result<i32, String> {
 
 fn cmd_sign_here(args: &[String]) -> Result<i32, String> {
     if args.len() != 1 {
-        return Err("usage: git signet sign-here <private-key-path>".into());
+        return Err("usage: git signet sign-here <signing-key>".into());
     }
     let k = configure_signing_here(Path::new(&args[0]))?;
     let marker = format_marker(&k);
-    println!("Configured local repository to SSH-sign commits and tags with {marker}");
+    println!("Every commit in this repository will be signed with {marker}");
     Ok(0)
 }
 
@@ -233,8 +258,15 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
             .unwrap_or_else(|| rev_str.to_string())
     };
 
-    let remote_keys = repo.remote_keys()?;
-    let inferred = repo.required_key_for_ref(&full_ref, &remote_keys, true)?;
+    // An explicit check also looks at local branches: a branch answers to the key of the
+    // remote it tracks, or of the repository's only remote.
+    let remotes = repo.remotes()?;
+    let tracked = match full_ref.strip_prefix("refs/heads/") {
+        Some(branch) => repo.config_get(&format!("branch.{branch}.remote"))?,
+        None => None,
+    };
+    let attributed = tracked.or_else(|| remotes.sole().map(str::to_string));
+    let inferred = governing_key(&full_ref, &remotes, attributed.as_deref(), true)?;
 
     let (expected_key, source) = match (explicit_key, inferred) {
         (Some(ek_s), Some((ik, isrc))) => {
@@ -252,17 +284,15 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
         (None, Some((ik, isrc))) => (ik, isrc),
         (None, None) => {
             return Err(format!(
-                "no ed25519 key found in ref {:?} or remote URL (pass --key ed25519-<52-base32>)",
+                "no verifying key in the name of {:?} or in its remote's URL (pass --key ed25519-<52-base32>)",
                 sanitize_for_tty(&full_ref)
             ));
         }
     };
 
-    let kind = verify_object_signature(&repo, &oid, &expected_key)?;
+    let what = verify_object_signature(&repo, &oid, &expected_key)?;
     println!(
-        "GOOD {} {} signed by {} ({source})",
-        kind.as_str(),
-        oid,
+        "GOOD {what} {oid}: signed by {} (key from {source})",
         format_marker(&expected_key)
     );
     Ok(0)
@@ -274,6 +304,6 @@ fn cmd_fsck(args: &[String]) -> Result<i32, String> {
     }
     let repo = GitRepo::open(None)?;
     let (verified, unpinned) = fsck_all_refs(&repo)?;
-    println!("signet fsck: {verified} pinned ref(s) verified, {unpinned} unpinned ref(s)");
+    println!("signet fsck: {verified} ref(s) verified, {unpinned} ref(s) not governed by a key");
     Ok(0)
 }

@@ -4,123 +4,157 @@
 
 ## 1. What it is
 
-Stock Git can sign commits and annotated tags with SSH Ed25519 keys, and
-forges like GitHub already display those signatures. What Git lacks is a way
-for a user who clones a repository to know *which* public key is supposed to
-sign it—without maintaining keyrings, GPG webs of trust, or per-repo
-`allowed_signers` files.
+Stock Git can sign commits and tags with an SSH Ed25519 key. What it lacks is
+a way for someone cloning a repository to know which key is supposed to have
+signed it, short of keyrings and per-repository `allowed_signers` files.
 
-`git-signet` puts the 32-byte Ed25519 verifying key directly into an
-identifier users already copy, paste, clone, and pin:
+git signet puts the 32-byte verifying key into a name that users already
+copy and paste:
 
-1. **a repository name** in the clone URL (`acme-tls.ed25519-<52-base32>`), or
-2. **a branch or tag name** (`main+ed25519-<52-base32>`, `v2.4.0+ed25519-<52-base32>`).
+1. the repository's name, in the URL they clone
+   (`acme-tls.ed25519-<52-base32>`), or
+2. a branch or tag name (`main+ed25519-<52-base32>`).
 
-Standard Git, GitHub, Cargo, Nix, and CI treat those as ordinary names. Any
-client running `git-signet` automatically extracts the public key and verifies
-the OpenSSH Git signature on every `clone`, `fetch`, `pull`, `commit`, and
-`fsck`—aborting before writing a single file to disk if the signature is
-missing, forged, or signed by a different key.
+To Git, a forge, Cargo and Nix these are ordinary names. A client running
+git signet reads the key out of the name and checks the signature on what it
+fetches, before any ref changes and before any file is written.
 
-## 2. Key encoding
+## 2. The key in a name
 
-A verifying key marker has the exact form:
+A verifying key is written
 
     ed25519-<52-base32>
 
-* The raw key is a 32-byte Ed25519 public key.
-* `<52-base32>` is its canonical unpadded lowercase RFC 4648 base32 encoding
-  (alphabet `[a-z2-7]`, 52 characters, 260 bits; the 4 trailing padding bits
-  MUST be zero, so the 52nd character MUST be `a` or `q`).
-* Total marker length: 60 ASCII characters, strictly in `[a-z0-9-]`.
+* `<52-base32>` is the 32-byte Ed25519 verifying key in unpadded lowercase
+  RFC 4648 base32 (alphabet `a`-`z`, `2`-`7`). 52 characters hold 260 bits;
+  the last 4 must be zero, so the 52nd character is `a` or `q`.
+* The whole thing is 60 characters from `[a-z0-9-]`.
 
-To verify standard OpenSSH Git signatures (`gpg.format = ssh`, namespace
-`"git"`), the reader reconstructs the 51-byte OpenSSH public key wire blob:
+`ed25519-` begins a key only at the start of a name or after `.` (in a ref
+name, also after `+`), and only when exactly 52 base32 characters follow and
+then the name ends or continues with `.` (or `+`). Anything else is an
+ordinary name: a repository called `ed25519-dalek`, a branch called
+`fix/ed25519-parsing`.
 
-    00 00 00 0b "ssh-ed25519" 00 00 00 20 || <32-byte raw key>
+Three things are errors, not ordinary names:
 
-base64-encodes it, and checks the signature against that single key with
-`ssh-keygen -Y verify -n git`.
+* 40 or more letters and digits in a key's place that are not a key (one
+  damaged in copying);
+* a key followed by `~`, `^`, `@` or `:`, or in a name containing `..`
+  (`main+ed25519-…~1` would otherwise look as if it pinned the parent);
+* two different keys in one name.
 
-## 3. Where keys live
+Signatures are OpenSSH signatures in the namespace `git`, the ones
+`git commit -S` makes with `gpg.format = ssh`. To check one, a reader builds
+the 51-byte OpenSSH key
 
-### Repository name (in the remote URL)
+    00 00 00 0b "ssh-ed25519" 00 00 00 20 || <the 32 bytes>
 
-Extract the final path component of the remote URL (after the last `/` or `:`,
-stripping any trailing `/` and optional `.git` suffix). If it contains
-`.ed25519-<52-base32>` (or equals `ed25519-<52-base32>`), that key governs:
+and runs `ssh-keygen -Y verify -n git` with that as the only allowed signer.
 
-* every ref under `refs/remotes/<remote>/*`;
-* every local branch configured with `branch.<name>.remote = <remote>`;
-* on `git clone`, the initial `HEAD`, local branch, and tags fetched from
-  `origin`—protecting even a brand-new clone before any file is checked out,
-  even if a compromised host renames the default branch.
+## 3. Where a key can be, and what it governs
 
-Example (70 characters; well within GitHub's 100-character repo name limit):
+**In a repository's name.** The repository name is the last component of a
+remote's URL, after the last `/` or `:`, without a trailing `/` or `.git`.
+A key there is the key of that remote. It governs:
 
-    https://github.com/maya/acme-tls.ed25519-74nfu4k2ulfcryjbwknkyjbdbd7tlna3gfwm3fiomrr5e2t4pswa
+* every remote-tracking ref of that remote, `refs/remotes/<remote>/*`;
+* the tags that arrive in the same clone or fetch as that remote's branches;
+* in a bare repository with exactly one remote (a mirror): its tags, its
+  branches and `HEAD`.
 
-### Branch or tag name
+**In a branch or tag name.** A key in any `/`-separated part of a ref's name
+governs that ref: the remote-tracking ref of a branch so named, a tag so
+named, and in a bare repository a branch so named. It may sit beside
+git-buttress's `+blake3-<64-hex>`, in either order.
 
-If any `/`-separated segment of a refname contains `.ed25519-<52-base32>` or
-`+ed25519-<52-base32>` (or equals `ed25519-<52-base32>`), that key governs
-that ref—without requiring the repository itself to be renamed.
+**Never a local branch.** In a repository with a working tree, `refs/heads/*`
+and `HEAD` are the user's own work. `git commit`, `git merge`, `git rebase`
+and `git pull` are never refused, whoever's key the branch or the remote
+names.
 
-Markers may be chained with `git-buttress`'s `+blake3-<64-hex>` pin in either
-order (for example `v2.4.0+ed25519-<52>+blake3-<64>`).
+If a ref is governed by a key in its name and a key in its remote's URL, the
+two must be the same key.
 
-### Fail-closed parsing rules
+## 4. What a governed ref must point at
 
-* Any malformed `ed25519-` token (wrong length, uppercase, padding `=`,
-  non-zero trailing pad bits, invalid delimiter) MUST be rejected as an error.
-* Any revision traversal operator (`^`, `~`, `..`) combined with an
-  `ed25519-` marker MUST be rejected as ambiguous.
-* If both a remote URL and a refname specify keys and those keys differ, the
-  reader MUST fail closed with a conflict error.
+* **A commit** carrying exactly one `gpgsig` header, an OpenSSH signature by
+  the key over the commit without that header.
+* **A tag** that carries such a signature itself (over the tag without its
+  signature block), or that names, through any chain of tags, a commit that
+  does. So lightweight tags, plain annotated tags and signed tags are all
+  accepted on a signed commit, and a signed tag is accepted on an unsigned one.
+* Anything else is refused: a tree, a blob, a GnuPG signature, a signature by
+  another key, no signature.
 
-## 4. What is verified
+Only the object the ref points at is checked, not its ancestors.
 
-* **Commits:** Must carry exactly one `gpgsig` header containing a valid
-  OpenSSH `-----BEGIN SSH SIGNATURE-----` block signing the commit bytes
-  (with `gpgsig` and its continuation lines removed) under namespace `"git"`
-  by the required Ed25519 key. Duplicate `gpgsig` headers and non-SSH (GPG)
-  signatures are rejected.
-* **Annotated tags:** Must end with a single terminal
-  `-----BEGIN SSH SIGNATURE-----` block signing the tag bytes preceding the
-  signature block under namespace `"git"` by the required Ed25519 key. An
-  unsigned annotated tag pointing to a signed commit is rejected.
-* **Trees and blobs:** Rejected (cannot carry Git signatures).
-* **Isolation:** Readers pass `--no-replace-objects` and `GIT_NO_LAZY_FETCH=1`
-  to Git, and never invoke a `gpg.ssh.program` read from untrusted repo-local
-  `.git/config`.
+A reader passes `--no-replace-objects` and `GIT_NO_LAZY_FETCH=1` to Git and
+runs the system's `ssh-keygen`, never a `gpg.ssh.program` named by the
+repository's own configuration.
 
-## 5. Composing with `git-buttress`
+`git signet fsck` checks every remote-tracking ref, every tag (against the
+key of the repository's only remote, when it has exactly one), and in a bare
+repository every branch. `git signet check <rev>` checks one revision,
+including a local branch, against the key in its name, the key of the remote
+it tracks, or `--key`.
 
-`git-signet` and [`git-buttress`](https://github.com/jasonhadler25/git-buttress)
-solve complementary halves of Git's supply-chain problem and compose cleanly:
+## 5. Signing
 
-* **`git-signet`** authenticates *who* signed a ref without GPG, CAs,
-  keyservers, or `allowed_signers` files (stopping compromised Git hosts,
-  stolen forge tokens, and hostile mirrors).
-* **`git-buttress`** replaces Git's SHA-1 Merkle spine with BLAKE3 inside
-  commit headers *before* signing (stopping SHA-1 / SHA1DC file and history
-  collisions even against a valid commit signature).
-* **Together:** On Git 2.56+, both register independent native config hooks
-  (`[hook "signet-reference-transaction"]` and `[hook "buttress-*"]`) without
-  touching `core.hooksPath`. A single `git clone` verifies both the Ed25519
-  signature against the URL/branch key and the entire BLAKE3 tree and history.
+The signatures are stock Git's, so stock Git makes them. `git signet adopt
+<signing-key>` (or `keygen`, which makes a key first) writes, once per
+machine:
 
-## 6. What it does not do
+* `~/.config/git-signet/sign/<key>.gitconfig`, holding `gpg.format = ssh`,
+  `user.signingkey = <signing-key>` and `commit.gpgsign = true`;
+* four `includeIf` entries in the global Git configuration that include that
+  file when the current branch's name, or any remote's URL, contains the key.
 
-* **Rollback / freeze attacks:** A valid signature proves the holder of the
-  key signed that commit at some point—not that it is the newest commit they
-  ever signed. A hostile mirror can still replay an older signed commit unless
-  pinned to a specific commit/tag digest (e.g., via `git-buttress`
-  `+blake3-...` or `--expect`).
-* **Key rotation:** Because the key *is* the identifier, rotating keys means
-  publishing a new branch or repository name carrying the new key. There is
-  deliberately no hidden delegation or revocation server.
-* **Non-Git-hook clients:** Clients that fetch without running Git's
-  `reference-transaction` hook (such as `jj git fetch`, `gix clone`, or
-  GitHub `.tar.gz` downloads) are not blocked automatically; run
-  `git signet check` or `git signet fsck` explicitly after fetching.
+From then on plain `git commit` in such a repository or on such a branch is
+signed as Git creates it; so are the commits made by `git merge`,
+`git rebase`, `git cherry-pick`, `git revert` and `git am`. Nothing happens
+anywhere else, and nothing happens for someone who does not hold the key.
+
+The branch-name condition is off while `HEAD` is detached, which is where a
+rebase stops for a conflict. So the first time a branch whose name carries an
+adopted key is created or moved, git signet records
+`include.path = <that file>` in the repository's own configuration, and says
+so. From then on every commit in that repository is signed.
+
+Tags are not signed automatically. Git's setting for that, `tag.gpgSign`,
+makes plain `git tag <name>` demand a message. Section 4 accepts a tag on a
+signed commit as it is.
+
+## 6. With git-buttress
+
+[git-buttress](https://github.com/jasonhadler25/git-buttress) adds BLAKE3
+digests of the files and history to each commit before it is signed. The two
+check different things and are installed side by side, each as a Git 2.56
+configured hook, neither touching `core.hooksPath`:
+
+* git signet: was this signed by the key in the name? A SHA-1 collision
+  defeats it alone, because the signature covers only SHA-1 identifiers.
+* git-buttress: do the files and history match the BLAKE3 digests in the
+  commit? Someone who can push defeats it alone, by writing new digests.
+* Together, the signature covers the digests.
+
+## 7. What it does not do
+
+* **It does not tie a commit to a ref's name.** The signature covers the
+  commit, not which branch or tag it belongs under. A server can answer with
+  an older signed commit (rollback), or serve one branch's signed commit as
+  another branch or as a tag. A digest pinned from elsewhere (git-buttress's
+  `--expect` or `+blake3-`) closes this for one revision.
+* **In a repository whose name carries a key, every branch must be signed by
+  it.** A branch pushed by a bot, or a commit made by a forge's merge button,
+  makes clone and fetch fail for everyone running git signet until it is
+  gone. A key in a branch's name constrains only that branch.
+* **Tags that arrive alone are not checked on arrival.** A fetch that brings
+  new tags and moves no branch gives the hook no way to tell them from tags
+  made locally. `git signet fsck` checks them.
+* **Refs fetched outside a remote's namespace are not checked**:
+  `git pull <url>`, `git fetch <remote> <branch>:<local-branch>`.
+* **Clients that do not run Git's hooks are not stopped**: `jj git fetch`,
+  `gix clone`, Cargo's fetcher, a forge's tarball. Run `git signet fsck`.
+* **No key rotation.** The key is the name. A new key is a new name.
+* **Not post-quantum.** Ed25519.

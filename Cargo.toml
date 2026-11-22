@@ -1,8 +1,8 @@
 [package]
 name = "git-signet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Zero-PKI self-certifying Ed25519 signing keys embedded in Git repo, branch, and tag names"
+description = "Ed25519 verifying keys carried in Git repository, branch, and tag names"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jasonhadler25/git-signet"
 
