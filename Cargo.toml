@@ -1,0 +1,20 @@
+[package]
+name = "git-signet"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-PKI self-certifying Ed25519 signing keys embedded in Git repo, branch, and tag names"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jasonhadler25/git-signet"
+
+[[bin]]
+name = "git-signet"
+path = "src/main.rs"
+
+# Intentionally ZERO external crates!
+# Cryptographic verification delegates to OpenSSH `ssh-keygen -Y verify` over standard
+# Git SSH signatures (`gpg.format = ssh`), keeping the build-time and runtime supply chain minimal.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
