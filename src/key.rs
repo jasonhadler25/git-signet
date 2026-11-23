@@ -383,7 +383,74 @@ mod tests {
         // A key damaged in copying (one character short, or uppercased) fails loudly
         assert!(extract_key_from_refname(&format!("refs/heads/main+{}", &m[..m.len() - 1])).is_err());
         assert!(extract_key_from_remote_url(&format!("https://h/acme.ed25519-{}", m[8..].to_uppercase())).is_err());
-        // Walk syntax rejected
+        // Walk syntax rejected (each operator tested both after marker and in an earlier segment)
         assert!(extract_key_from_refname(&format!("main+{m}~1")).is_err());
+        assert!(extract_key_from_refname(&format!("main+{m}^")).is_err());
+        assert!(extract_key_from_refname(&format!("main+{m}..other")).is_err());
+        assert!(extract_key_from_refname(&format!("a^1/main+{m}")).is_err());
+        assert!(extract_key_from_refname(&format!("a~1/main+{m}")).is_err());
+
+        // parse_marker round-trip and bad prefix
+        assert_eq!(parse_marker(&m).unwrap(), k);
+        assert!(parse_marker("rsa-aaaa").is_err());
+
+        // Identical vs conflicting keys across segments and within one segment
+        let k2 = [0x99; 32];
+        let m2 = format_marker(&k2);
+        assert_eq!(extract_key_from_refname(&format!("refs/heads/{m}/{m}")).unwrap(), Some(k));
+        assert!(extract_key_from_refname(&format!("refs/heads/{m}/{m2}")).is_err());
+        assert_eq!(extract_key_from_refname(&format!("refs/heads/a.{m}.{m}")).unwrap(), Some(k));
+        assert!(extract_key_from_refname(&format!("refs/heads/a.{m}.{m2}")).is_err());
+
+        // `+` delimiter is allowed in refnames, NOT in remote repo URLs
+        assert_eq!(
+            extract_key_from_remote_url(&format!("https://github.com/maya/acme+{m}.git")).unwrap(),
+            None
+        );
+        // Bare segment with marker at index 0 (no `/` or `:`) and marker preceded by non-delim `-`
+        assert_eq!(extract_key_from_remote_url(&m).unwrap(), Some(k));
+        assert_eq!(extract_key_from_remote_url(&format!("https://h/{m}.git")).unwrap(), Some(k));
+        assert_eq!(
+            extract_key_from_remote_url(&format!("https://h/prefix-{m}.git")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn base64_and_openssh_wire_edge_cases() {
+        // Test all remainder classes (len % 3 == 0, 1, 2) plus RFC 4648 test vectors
+        for (raw, enc) in [
+            (&b"f"[..], "Zg=="),
+            (&b"fo"[..], "Zm8="),
+            (&b"foo"[..], "Zm9v"),
+            (&b"foob"[..], "Zm9vYg=="),
+            (&b"fooba"[..], "Zm9vYmE="),
+            (&b"foobar"[..], "Zm9vYmFy"),
+            (&[0x00, 0xff, 0x80, 0x7f, 0x01][..], "AP+AfwE="),
+        ] {
+            assert_eq!(base64_encode(raw), enc);
+            assert_eq!(base64_decode(enc).unwrap(), raw);
+        }
+        // Invalid lengths, premature padding, and invalid characters
+        assert!(base64_decode("").is_err());
+        assert!(base64_decode("Zm9").is_err());
+        assert!(base64_decode("Zg==Zm9v").is_err());
+        assert!(base64_decode("Zm8=Zm9v").is_err());
+        assert!(base64_decode("Z=9v").is_err());
+        assert!(base64_decode("Zm!v").is_err());
+
+        // OpenSSH wire format checks: valid, wrong prefix (still 51 bytes), wrong length (valid prefix)
+        let k = [0x5a; 32];
+        let mut wire = [0u8; 51];
+        wire[..19].copy_from_slice(OPENSSH_ED25519_WIRE_PREFIX);
+        wire[19..51].copy_from_slice(&k);
+        let line = format!("ssh-ed25519 {} comment", base64_encode(&wire));
+        assert_eq!(parse_openssh_ed25519_pubkey(&line).unwrap(), k);
+
+        let mut bad_prefix = wire;
+        bad_prefix[0] ^= 1;
+        assert!(parse_openssh_ed25519_pubkey(&format!("ssh-ed25519 {}", base64_encode(&bad_prefix))).is_err());
+        assert!(parse_openssh_ed25519_pubkey(&format!("ssh-ed25519 {}", base64_encode(&wire[..50]))).is_err());
+        assert!(parse_openssh_ed25519_pubkey("ssh-rsa AAAA").is_err());
     }
 }

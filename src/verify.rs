@@ -264,3 +264,62 @@ pub fn verify_ssh_signature(
         Err(format!("INVALID Ed25519 signature: {detail}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn extract_tag_ssh_signature_and_armor_validation() {
+        let header_and_msg = b"object 0123456789abcdef0123456789abcdef01234567\ntype commit\ntag v1.0\ntagger Maya <m@e> 1 +0000\n\nRelease v1.0\n";
+        let sig_block = b"-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(header_and_msg);
+        raw.extend_from_slice(sig_block);
+
+        let (payload, sig) = extract_tag_ssh_signature(&raw).unwrap();
+        assert_eq!(payload, header_and_msg);
+        assert_eq!(sig, sig_block);
+
+        // Also valid without trailing newline after END line
+        let mut raw_no_lf = Vec::new();
+        raw_no_lf.extend_from_slice(header_and_msg);
+        raw_no_lf.extend_from_slice(b"-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----");
+        let (p2, s2) = extract_tag_ssh_signature(&raw_no_lf).unwrap();
+        assert_eq!(p2, header_and_msg);
+        assert!(s2.ends_with(b"-----END SSH SIGNATURE-----"));
+
+        // Reject missing \n\n separator
+        assert!(extract_tag_ssh_signature(b"object abc\ntype commit\ntag v1").is_err());
+        // Reject missing SSH signature block (e.g. PGP)
+        let mut pgp = header_and_msg.to_vec();
+        pgp.extend_from_slice(b"-----BEGIN PGP SIGNATURE-----\nXXX\n-----END PGP SIGNATURE-----\n");
+        assert!(extract_tag_ssh_signature(&pgp).is_err());
+        // Reject duplicate SSH signature blocks
+        let mut dup = raw.clone();
+        dup.extend_from_slice(sig_block);
+        assert!(extract_tag_ssh_signature(&dup).is_err());
+        // Reject trailing bytes after END line
+        let mut trailing = raw.clone();
+        trailing.extend_from_slice(b"extra trailing line\n");
+        assert!(extract_tag_ssh_signature(&trailing).is_err());
+
+        // validate_ssh_sig_armor rejects either wrong BEGIN or wrong END independently
+        assert!(validate_ssh_sig_armor(b"-----BEGIN SSH SIGNATURE-----\r\nX\r\n-----END SSH SIGNATURE-----\r\n").is_ok());
+        assert!(validate_ssh_sig_armor(b"-----BEGIN PGP SIGNATURE-----\nX\n-----END SSH SIGNATURE-----\n").is_err());
+        assert!(validate_ssh_sig_armor(b"-----BEGIN SSH SIGNATURE-----\nX\n-----END PGP SIGNATURE-----\n").is_err());
+    }
+
+    #[test]
+    fn private_temp_dir_mode_and_drop_cleanup() {
+        let dir_path = {
+            let td = PrivateTempDir::create("git-signet-ut").unwrap();
+            let p = td.0.clone();
+            assert!(p.is_dir());
+            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o700);
+            p
+        };
+        assert!(!dir_path.exists(), "PrivateTempDir::drop must remove temp dir");
+    }
+}

@@ -463,3 +463,110 @@ fn key_holders_sign_without_setup_and_nobody_elses_commits_are_refused() {
     assert!(s.git(&dalek, &["commit", "-m", "a"]).status.success());
     assert!(s.git(&dalek, &["switch", "-c", "fix/ed25519-parsing"]).status.success());
 }
+
+#[test]
+fn cli_subcommands_fsck_disable_and_unadopt_coverage() {
+    let sb = Sandbox::new();
+
+    // 1. Help / version / unknown subcommand
+    for args in [&[][..], &["-h"][..], &["--help"][..], &["help"][..]] {
+        let out = sb.signet(&sb.root, args);
+        assert!(out.status.success(), "help {args:?} failed");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("USAGE:"));
+    }
+    let ver = sb.signet(&sb.root, &["--version"]);
+    assert!(ver.status.success());
+    assert!(String::from_utf8_lossy(&ver.stdout).contains("git-signet"));
+    assert_eq!(sb.signet(&sb.root, &["nope"]).status.code(), Some(1));
+
+    // 2. format-key + keygen (using pre-created keypair so ssh-keygen doesn't prompt) + unadopt
+    let (key_path, marker) = sb.gen_ed25519("maya");
+    let pub_path = key_path.with_extension("pub");
+    let fk = sb.signet(&sb.root, &["format-key", pub_path.to_str().unwrap()]);
+    assert!(fk.status.success());
+    assert_eq!(String::from_utf8_lossy(&fk.stdout).trim(), marker);
+    assert_eq!(sb.signet(&sb.root, &["format-key"]).status.code(), Some(1));
+
+    let kg = sb.signet(
+        &sb.root,
+        &["keygen", "--file", key_path.to_str().unwrap(), "--comment", "test-key"],
+    );
+    assert!(kg.status.success(), "keygen failed: {}", String::from_utf8_lossy(&kg.stderr));
+    let kg_out = String::from_utf8_lossy(&kg.stdout);
+    assert!(kg_out.contains(&format!("Verifying key: {marker}")));
+    assert_eq!(sb.signet(&sb.root, &["keygen", "--bogus"]).status.code(), Some(1));
+    assert_eq!(sb.signet(&sb.root, &["keygen", "--file"]).status.code(), Some(1));
+
+    // Verify adopt wrote includeIf; then unadopt removes it!
+    let cfg_before = sb.git(&sb.root, &["config", "--global", "--list"]);
+    assert!(String::from_utf8_lossy(&cfg_before.stdout).contains(&marker));
+    let un = sb.signet(&sb.root, &["unadopt", key_path.to_str().unwrap()]);
+    assert!(un.status.success());
+    assert!(String::from_utf8_lossy(&un.stdout).contains(&marker));
+    let cfg_after = sb.git(&sb.root, &["config", "--global", "--list"]);
+    assert!(
+        !String::from_utf8_lossy(&cfg_after.stdout).contains(&marker),
+        "unadopt must remove includeIf entries"
+    );
+
+    // 3. enable / disable CLI flags (--global --local conflict, local disable, global disable)
+    assert_eq!(sb.signet(&sb.root, &["enable", "--global", "--local"]).status.code(), Some(1));
+    assert_eq!(sb.signet(&sb.root, &["disable", "--global", "--local"]).status.code(), Some(1));
+    assert_eq!(sb.signet(&sb.root, &["disable", "--bogus"]).status.code(), Some(1));
+    assert!(sb.signet(&sb.root, &["enable", "--global"]).status.success());
+
+    // 4. Repository with 2 verified pinned refs + 2 unpinned refs -> `fsck` and `check --key`
+    let repo = sb.root.join("multi");
+    assert!(sb.git(&sb.root, &["init", "-q", "-b", "plain1", repo.to_str().unwrap()]).status.success());
+    fs::write(repo.join("f.txt"), "one\n").unwrap();
+    assert!(sb.git(&repo, &["add", "f.txt"]).status.success());
+    assert!(sb.git(&repo, &["commit", "-q", "-m", "plain commit"]).status.success());
+    assert!(sb.git(&repo, &["branch", "plain2"]).status.success());
+
+    // Sign a commit and put TWO keyed tags on it (in non-bare repos, tags/remotes are governed while local branches are ungoverned)
+    assert!(sb.signet(&repo, &["sign-here", key_path.to_str().unwrap()]).status.success());
+    let b1 = format!("rel1+{marker}");
+    assert!(sb.git(&repo, &["checkout", "-q", "-b", &b1]).status.success());
+    fs::write(repo.join("f.txt"), "signed\n").unwrap();
+    assert!(sb.git(&repo, &["commit", "-q", "-am", "signed commit"]).status.success());
+    assert!(sb.git(&repo, &["tag", &format!("v1+{marker}")]).status.success());
+    assert!(sb.git(&repo, &["tag", &format!("v2+{marker}")]).status.success());
+
+    // `check --key` on plain branch vs signed branch + bad args
+    let chk_good = sb.signet(&repo, &["check", &b1, "--key", &marker]);
+    assert!(chk_good.status.success());
+    let chk_bad = sb.signet(&repo, &["check", "plain1", "--key", &marker]);
+    assert_eq!(chk_bad.status.code(), Some(1));
+    assert_eq!(sb.signet(&repo, &["check", "--bogus"]).status.code(), Some(1));
+    assert_eq!(sb.signet(&repo, &["check", "--key"]).status.code(), Some(1));
+
+    // `fsck` must report EXACT counts: 2 verified tags, 3 ungoverned local branches (plain1, plain2, rel1+...)!
+    let fsck = sb.signet(&repo, &["fsck"]);
+    assert!(fsck.status.success(), "fsck failed: {}", String::from_utf8_lossy(&fsck.stderr));
+    let fsck_out = String::from_utf8_lossy(&fsck.stdout);
+    assert!(
+        fsck_out.contains("2 ref(s) verified, 3 ref(s) not governed by a key"),
+        "unexpected fsck output: {fsck_out}"
+    );
+
+    // Bare repo fsck verifies branches too (exercises is_bare == true)!
+    let bare = sb.root.join("bare.git");
+    assert!(sb.git(&sb.root, &["clone", "--bare", "-q", repo.to_str().unwrap(), bare.to_str().unwrap()]).status.success());
+    let bare_fsck = sb.signet(&bare, &["fsck"]);
+    assert!(bare_fsck.status.success(), "bare fsck failed: {}", String::from_utf8_lossy(&bare_fsck.stderr));
+    let bare_out = String::from_utf8_lossy(&bare_fsck.stdout);
+    assert!(
+        bare_out.contains("3 ref(s) verified, 2 ref(s) not governed by a key"),
+        "unexpected bare fsck output: {bare_out}"
+    );
+
+    // Local enable & disable + global disable actually clear hook config
+    assert!(sb.signet(&repo, &["enable", "--local"]).status.success());
+    assert!(sb.signet(&repo, &["disable", "--local"]).status.success());
+    let loc_dis = sb.git(&repo, &["config", "--local", "--get", "signet.disabled"]);
+    assert_eq!(String::from_utf8_lossy(&loc_dis.stdout).trim(), "true");
+
+    assert!(sb.signet(&sb.root, &["disable", "--global"]).status.success());
+    let glob_hook = sb.git(&sb.root, &["config", "--global", "--get", "hook.signet-reference-transaction.command"]);
+    assert!(!glob_hook.status.success(), "disable --global must remove hook config");
+}

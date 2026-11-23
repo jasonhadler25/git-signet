@@ -804,3 +804,24 @@ pub fn configure_signing_here(key_path: &Path) -> Result<PubKey32, String> {
     }
     Ok(key)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn sanitize_and_parse_transaction_stdin() {
+        assert_eq!(sanitize_for_tty("ok\t\x1b[31m\r\n\x7f"), "ok??[31m???");
+        let ok = parse_transaction_stdin(Cursor::new(b"aaa bbb refs/heads/main\n")).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].2, b"refs/heads/main");
+        assert!(parse_transaction_stdin(Cursor::new(b"")).unwrap().is_empty());
+        assert!(parse_transaction_stdin(Cursor::new(b"nospace\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"one two\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b" bbb refs/heads/m\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa  refs/heads/m\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa bbb \n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa bbb refs/\0bad\n")).is_err());
+    }
+}
