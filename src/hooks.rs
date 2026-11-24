@@ -1,4 +1,4 @@
-//! Git hooks, key management, `gpg.format = x509` BLINCS signer/verifier,
+//! Git hooks, signet seed management, `gpg.format = x509` BLINCS imprinter/verifier,
 //! and unified BLAKE3 + transitive-closure BLINCS verification.
 
 use crate::blake3_chain::{
@@ -488,8 +488,8 @@ pub fn run_x509_program(args: &[String]) -> Result<i32, String> {
     }
 
     if do_verify {
-        let sig_path = positional.first().ok_or("--verify requires signature file path")?;
-        let armor = fs::read(sig_path).map_err(|e| format!("read signature file {sig_path}: {e}"))?;
+        let sig_path = positional.first().ok_or("--verify requires imprint file path")?;
+        let armor = fs::read(sig_path).map_err(|e| format!("read imprint file {sig_path}: {e}"))?;
         let mut payload = Vec::new();
         io::stdin().read_to_end(&mut payload).map_err(|e| format!("read payload from stdin: {e}"))?;
         let mut repo = GitRepo::open(None)?;
@@ -588,7 +588,7 @@ pub fn add_blake3_headers_to_commit(repo: &mut GitRepo, oid: &Oid) -> Result<Oid
         Ok((_, armor)) => match decode_imprint_armor(&armor) {
             Ok((id, _)) => Some(id),
             Err(_) => {
-                // Non-BLINCS signature (e.g. legacy GPG/SSH): leave untouched rather than stripping someone else's signature.
+                // Non-BLINCS gpgsig (e.g. GPG/SSH): leave untouched rather than stripping another tool's header.
                 return Ok(*oid);
             }
         },

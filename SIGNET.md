@@ -44,7 +44,7 @@ The decoded binary payload is **exactly 5,656 bytes**:
 | Offset | Length | Contents |
 |---|---|---|
 | `0` | `8` | ASCII magic `BLINCSg1` |
-| `8` | `32` | Signer `SignetId` bytes |
+| `8` | `32` | `SignetId` bytes |
 | `40` | `5616` | Raw BLINCS `Imprint` bytes (`blincs::IMPRINT_LEN`) |
 
 Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 5,656 bytes or whose magic is not `BLINCSg1`.
@@ -63,7 +63,7 @@ Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank
 | Plain / stale commit | `"git-signet 2026-11-24 plain commit"` |
 
 ### 3.1 File digest
-`D_file(blob)` is `BLAKE3_keyed(K_file, raw_blob_bytes)` (computed streaming; blobs `>= 64 KiB` use `blake3-servil`'s multi-core `Pipeline`).
+`D_file(blob)` is `BLAKE3_derive_key("git-signet 2026-11-24 file", raw_blob_bytes)` (computed streaming; blobs `>= 64 KiB` use `blake3-servil`'s multi-core `Pipeline`).
 
 ### 3.2 Directory digest
 Given a Git tree object parsed into canonical entries `(mode, name, oid)`:
@@ -73,7 +73,7 @@ Given a Git tree object parsed into canonical entries `(mode, name, oid)`:
     - for gitlink (`160000`): the 20-byte raw submodule OID;
     - for directory (`40000`): the 32-byte `D_dir(subtree)`;
     - for file/symlink: the 32-byte `D_file(blob)`.
-- `D_dir(tree)` is `BLAKE3_keyed(K_dir, concatenated_entries)`.
+- `D_dir(tree)` is `BLAKE3_derive_key("git-signet 2026-11-24 directory", concatenated_entries)`.
 - Cycles and nesting deeper than 4,096 levels are rejected.
 
 ### 3.3 Commit headers
@@ -82,8 +82,8 @@ A commit carrying BLAKE3 headers includes, directly after the `committer` header
 - Exactly one `signet-parent blake3 <64-hex-D_commit>` line per `parent` header, in exact parent order.
 
 ### 3.4 Commit digest and classification
-- **Carrying commit:** has valid `signet-tree` matching `tree` and valid `signet-parent` lines matching every `parent`. Its commit digest is `D_commit(C) = BLAKE3_keyed(K_commit, raw_commit_bytes)`.
-- **Plain commit:** has zero `signet-tree` and zero `signet-parent` lines. Its commit digest is `D_commit(C) = BLAKE3_keyed(K_plain, D_dir(tree) || u32_le(parents.len()) || D_commit(p_0) || ... || raw_commit_bytes)`.
+- **Carrying commit:** has valid `signet-tree` matching `tree` and valid `signet-parent` lines matching every `parent`. Its commit digest is `D_commit(C) = BLAKE3_derive_key("git-signet 2026-11-24 commit", raw_commit_bytes)`.
+- **Plain commit:** has zero `signet-tree` and zero `signet-parent` lines. Its commit digest is `D_commit(C) = BLAKE3_derive_key("git-signet 2026-11-24 plain commit", D_dir(tree) || u32_le(parents.len()) || D_commit(p_0) || ... || raw_commit_bytes)`.
 - **Stale commit (`git commit --amend` artifact):** has exactly one `signet-tree` whose embedded tree OID differs from the commit's current `tree` OID (and zero malformed lines). Treated as plain during verification and replaced on `post-commit`.
 - **Malformed commit:** any duplicate `signet-tree`, mismatched `signet-parent` count/order, bad hex, or non-matching `signet-tree`/`signet-parent` digest is rejected.
 
@@ -93,7 +93,7 @@ Verification always uses a fresh **memory-only** digest map; unauthenticated dis
 
 ## 4. Salted Whole-Snapshot BLINCS Imprinting (Zero Pre-Hashing)
 
-Rather than imprinting only the commit's ~300 bytes (which would rely on BLAKE3 collision resistance for tree contents), `git-signet` streams the **entire commit (or annotated tag + target commit) plus a canonical depth-first walk of its entire tree and every file byte** directly into `blincs::Signet::imprint_reader` and `blincs::SignetId::verify_reader`. Because BLINCS mixes a fresh per-imprint random salt into the streaming message hash, forging a second tree under the same imprint requires breaking salted second-preimage resistance rather than unsalted collision resistance.
+Rather than imprinting only the commit's ~300 bytes (which would rely on unsalted BLAKE3 collision resistance for tree contents), `git-signet` streams the **entire commit (or annotated tag + target commit) plus a canonical depth-first walk of its entire tree and every file byte** directly into `blincs::Signet::imprint_reader` and `blincs::SignetId::verify_reader`. Because BLINCS mixes a fresh per-imprint random salt into the streaming message hash, forging a second tree under the same imprint requires breaking salted second-preimage resistance rather than unsalted collision resistance.
 
 ### 4.1 Commit snapshot stream
 Framed as:
@@ -101,28 +101,28 @@ Framed as:
 "git-signet 2026-11-24 commit-snapshot\0"
 || u64_le(commit_payload.len()) || commit_payload
 || TreeWalk(commit.tree)
+|| b'E'
 ```
 where `commit_payload` is the exact raw commit bytes with the `gpgsig` header removed.
 
 ### 4.2 Annotated tag snapshot stream
-If an annotated tag carries its own `BLINCSg1` imprint (e.g. `git tag -s`), its payload is peeled to its target commit `C` (rejecting tag cycles and depth `> 64`) and framed as:
+If an annotated tag targeting a commit (`type commit`) carries its own `BLINCSg1` imprint (e.g. `git tag -s`), its payload is framed together with its target commit and full target tree as:
 ```text
 "git-signet 2026-11-24 tag-snapshot\0"
 || u64_le(tag_payload.len()) || tag_payload
 || u64_le(target_commit_raw.len()) || target_commit_raw
 || TreeWalk(target_commit.tree)
+|| b'E'
 ```
-where `tag_payload` is the raw tag bytes preceding `-----BEGIN SIGNED MESSAGE-----`.
+where `tag_payload` is the raw tag bytes preceding `-----BEGIN SIGNED MESSAGE-----`. (An unimprinted tag, including nested tags up to depth 64, peels to its target commit and verifies that commit under §5.2.)
 
 ### 4.3 Canonical `TreeWalk(tree_oid)` stream
-Iterative depth-first traversal (explicit stack, max depth 4,096, cycle rejection):
-- On entering a tree: `b'D' || u32_le(entries.len())`
-- For each entry in Git tree order:
-  - `u32_le(mode.len()) || mode || u32_le(name.len()) || name`
-  - If gitlink (`160000`): `b'G' || oid_20_bytes`
-  - If subtree (`40000`): recurse `TreeWalk(entry.oid)`
-  - If file/symlink: `b'F' || u64_le(blob_len) || <raw blob bytes streamed directly from git cat-file --batch>`
-- On leaving a tree: `b'E'`
+Iterative depth-first traversal in Git's stored entry order (explicit stack, max depth 4,096, cycle rejection):
+- For each entry in `tree_oid`:
+  - If directory (`40000`): `b'D' || mode || b' ' || name || 0x00 || TreeWalk(entry.oid) || b'E'`
+  - If gitlink (`160000`): `b'G' || mode || b' ' || name || 0x00 || oid_20_bytes`
+  - If file or symlink (`100644`, `100755`, `120000`): `b'F' || mode || b' ' || name || 0x00 || u64_le(blob_len) || <raw blob bytes streamed directly from git cat-file --batch>`
+- The root `TreeWalk` is closed by the trailing `b'E'` shown in §4.1 and §4.2.
 
 ---
 
