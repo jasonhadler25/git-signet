@@ -1,0 +1,9 @@
+[profile.default]
+fail-fast = false
+status-level = "pass"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.mutants]
+fail-fast = true
+status-level = "fail"
+slow-timeout = { period = "15s", terminate-after = 2 }

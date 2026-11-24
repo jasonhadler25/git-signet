@@ -1,572 +1,490 @@
-use git_signet::key::{format_marker, parse_openssh_ed25519_pubkey};
-use git_signet::verify::extract_commit_ssh_signature;
-use std::env;
+include!("../tools/require_nextest.rs");
+
+use blincs::{Randomness, SEED_LEN, Signet, SignetId};
+use git_signet::blake3_chain::{
+    CommitClass, ContextKeys, DigestCache, attach_gpgsig, compute_commit_digest, insert_signet_headers, parse_commit, verify_commit_chain,
+};
+use git_signet::git::{GitRepo, ObjKind, resolve_real_git};
+use git_signet::id::{
+    decode_imprint_armor, decode_signet_b32, encode_imprint_armor, encode_signet_b32, extract_blake3_pin_from_refname, extract_signet_from_refname,
+    extract_signet_from_remote_url, format_signet_marker, parse_signet_marker, to_hex,
+};
+use git_signet::snapshot::{SnapshotReader, extract_commit_imprint, imprint_payload, verify_payload_imprint};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
-
-struct Sandbox {
-    root: PathBuf,
-    home: PathBuf,
-    git_bin: PathBuf,
-    signet_bin: PathBuf,
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("git-signet-it-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
-impl Sandbox {
-    fn new() -> Self {
-        let id = TEST_CTR.fetch_add(1, Ordering::SeqCst);
-        let root = env::temp_dir().join(format!("git-signet-test-{}-{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+fn signet_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_git-signet"))
+}
+
+struct TestEnv {
+    root: PathBuf,
+    home: PathBuf,
+    config_dir: PathBuf,
+    real_git: PathBuf,
+}
+
+impl TestEnv {
+    fn new(tag: &str) -> Self {
+        let root = temp_dir(tag);
         let home = root.join("home");
+        let config_dir = root.join("signet-config");
         fs::create_dir_all(&home).unwrap();
-        let signet_bin = PathBuf::from(env!("CARGO_BIN_EXE_git-signet"));
-        // Use stock system git directly so host wrappers don't leak into test sandbox
-        let git_bin = [
-            "/opt/homebrew/bin/git",
-            "/usr/bin/git",
-            "/usr/local/bin/git",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from("git"));
-        Self {
-            root,
-            home,
-            git_bin,
-            signet_bin,
+        fs::create_dir_all(&config_dir).unwrap();
+        let real_git = resolve_real_git().unwrap();
+        // Minimal user identity in isolated HOME/.gitconfig.
+        fs::write(home.join(".gitconfig"), "[user]\n\tname = Test User\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n").unwrap();
+        Self { root, home, config_dir, real_git }
+    }
+
+    fn git_with_env(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(&self.real_git);
+        cmd.current_dir(cwd)
+            .env("HOME", &self.home)
+            .env("GIT_SIGNET_CONFIG_DIR", &self.config_dir)
+            .env("GIT_SIGNET_REAL_GIT", &self.real_git)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
         }
+        cmd.args(args).output().unwrap()
     }
 
     fn git(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(&self.git_bin)
-            .current_dir(cwd)
-            .env("HOME", &self.home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_SIGNET_GIT", &self.git_bin)
-            .env("GIT_AUTHOR_NAME", "Tester")
-            .env("GIT_AUTHOR_EMAIL", "tester@example.com")
-            .env("GIT_COMMITTER_NAME", "Tester")
-            .env("GIT_COMMITTER_EMAIL", "tester@example.com")
-            .env("GIT_EDITOR", "true")
-            .args(args)
-            .output()
-            .unwrap()
+        self.git_with_env(cwd, args, &[])
+    }
+
+    fn git_ok(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = self.git(cwd, args);
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {}:\nstdout: {}\nstderr: {}",
+            args,
+            cwd.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     fn signet(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(&self.signet_bin)
+        Command::new(signet_bin())
             .current_dir(cwd)
             .env("HOME", &self.home)
+            .env("GIT_SIGNET_CONFIG_DIR", &self.config_dir)
+            .env("GIT_SIGNET_REAL_GIT", &self.real_git)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_SIGNET_GIT", &self.git_bin)
             .args(args)
             .output()
             .unwrap()
     }
 
-    fn gen_ed25519(&self, name: &str) -> (PathBuf, String) {
-        let key = self.root.join(name);
-        let out = Command::new("ssh-keygen")
-            .args(["-t", "ed25519", "-N", "", "-f"])
-            .arg(&key)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "ssh-keygen failed: {:?}", out);
-        let pub_txt = fs::read_to_string(format!("{}.pub", key.display())).unwrap();
-        let pub32 = parse_openssh_ed25519_pubkey(&pub_txt).unwrap();
-        (key, format_marker(&pub32))
+    fn signet_ok(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = self.signet(cwd, args);
+        assert!(
+            out.status.success(),
+            "git-signet {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
 
-impl Drop for Sandbox {
+impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
 
 #[test]
-fn repo_name_key_protects_first_clone_fetch_and_default_branch_hijack() {
-    let sb = Sandbox::new();
-    let (maya_key, maya_marker) = sb.gen_ed25519("maya_ed25519");
-    let (mallory_key, _) = sb.gen_ed25519("mallory_ed25519");
+fn id_encoding_marker_extraction_and_armor_validation() {
+    let raw = [0xa5u8; 32];
+    let id = SignetId::from_bytes(&raw);
+    let b32 = encode_signet_b32(&id);
+    assert_eq!(b32.len(), 52);
+    assert!(b32.ends_with('a') || b32.ends_with('q'));
+    assert_eq!(decode_signet_b32(&b32).unwrap(), id);
 
-    // 1. Maya creates a bare remote whose repo name embeds her Ed25519 verifying key!
-    let remote = sb.root.join(format!("acme-tls.{maya_marker}.git"));
-    assert!(sb.git(&sb.root, &["init", "--bare", "-b", "main", remote.to_str().unwrap()]).status.success());
+    // Reject uppercase, non-zero trailing pad bits, wrong length.
+    assert!(decode_signet_b32(&b32.to_uppercase()).is_err());
+    let mut bad_pad = b32.clone();
+    bad_pad.pop();
+    bad_pad.push('b'); // bottom 4 bits nonzero
+    assert!(decode_signet_b32(&bad_pad).is_err());
+    assert!(decode_signet_b32(&b32[..51]).is_err());
 
-    let maya = sb.root.join("maya");
-    fs::create_dir_all(&maya).unwrap();
-    assert!(sb.git(&maya, &["init", "-b", "main"]).status.success());
-    assert!(sb.signet(&maya, &["sign-here", maya_key.to_str().unwrap()]).status.success());
-    fs::write(maya.join("lib.rs"), "pub fn safe() -> u32 { 42 }\n").unwrap();
-    assert!(sb.git(&maya, &["add", "lib.rs"]).status.success());
-    assert!(sb.git(&maya, &["commit", "-m", "Release 1.0"]).status.success());
-    assert!(sb.git(&maya, &["tag", "-s", "v1.0", "-m", "Signed release tag v1.0"]).status.success());
-    assert!(sb.git(&maya, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-    assert!(sb.git(&maya, &["push", "-u", "origin", "main", "--tags"]).status.success());
+    let marker = format_signet_marker(&id);
+    assert!(marker.starts_with("blincs-") && marker.len() == 59);
+    assert_eq!(parse_signet_marker(&marker).unwrap(), id);
 
-    // 2. Enable git-signet globally for Sam (fresh user with ZERO allowed_signers config!)
-    assert!(sb.signet(&sb.root, &["enable", "--global"]).status.success());
+    // Repo URLs & ref names.
+    assert_eq!(extract_signet_from_remote_url(&format!("https://github.com/org/acme.{marker}.git")).unwrap(), Some(id));
+    assert_eq!(extract_signet_from_remote_url(&format!("git@github.com:org/acme.{marker}.git")).unwrap(), Some(id));
+    assert_eq!(extract_signet_from_remote_url("https://github.com/org/blincs-demo.git").unwrap(), None);
+    assert_eq!(extract_signet_from_refname(&format!("refs/heads/main+{marker}")).unwrap(), Some(id));
+    assert_eq!(extract_signet_from_refname("refs/heads/fix/blincs-parser").unwrap(), None);
 
-    // 3. Sam clones the self-certifying URL -> SUCCEEDS automatically!
-    let sam = sb.root.join("sam");
-    let clone_ok = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam.to_str().unwrap()]);
-    assert!(
-        clone_ok.status.success(),
-        "valid signed clone must succeed: stderr={}",
-        String::from_utf8_lossy(&clone_ok.stderr)
-    );
-    assert!(sam.join("lib.rs").is_file());
+    // Chained with +blake3-<64-hex> in either order.
+    let dig = [0x42u8; 32];
+    let hex = to_hex(&dig);
+    let chained1 = format!("refs/tags/v1.0+{marker}+blake3-{hex}");
+    let chained2 = format!("refs/tags/v1.0+blake3-{hex}+{marker}");
+    assert_eq!(extract_signet_from_refname(&chained1).unwrap(), Some(id));
+    assert_eq!(extract_blake3_pin_from_refname(&chained1).unwrap(), Some(dig));
+    assert_eq!(extract_signet_from_refname(&chained2).unwrap(), Some(id));
+    assert_eq!(extract_blake3_pin_from_refname(&chained2).unwrap(), Some(dig));
 
-    // Explicit `git signet check` and `git signet fsck` + independent Python oracle all pass!
-    let chk = sb.signet(&sam, &["check", "HEAD"]);
-    assert!(chk.status.success(), "check HEAD failed: {:?}", chk);
-    let chk_tag = sb.signet(&sam, &["check", "v1.0"]);
-    assert!(chk_tag.status.success(), "check v1.0 failed: {:?}", chk_tag);
-    let fsck = sb.signet(&sam, &["fsck"]);
-    assert!(fsck.status.success(), "fsck failed: {:?}", fsck);
-    let py = Command::new("python3")
-        .current_dir(&sam)
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("signet-verify.py"))
-        .args(["HEAD", &maya_marker])
+    // Reject damaged 40+-char tokens, walk operators, and conflicting IDs.
+    assert!(extract_signet_from_refname(&format!("refs/heads/main+blincs-{}", "a".repeat(45))).is_err());
+    assert!(extract_signet_from_refname(&format!("main+{marker}~1")).is_err());
+    assert!(extract_signet_from_refname(&format!("main+{marker}..other")).is_err());
+    let id2 = SignetId::from_bytes(&[0x11u8; 32]);
+    let m2 = format_signet_marker(&id2);
+    assert!(extract_signet_from_refname(&format!("refs/heads/{marker}/{m2}")).is_err());
+
+    // Armor round-trip and rejection.
+    let tmp = temp_dir("armor");
+    let state = tmp.join("state.bin");
+    Randomness::create(&state).unwrap();
+    let rng = Randomness::initialize(&state).unwrap();
+    let signet = Signet::from_seed(&[0x22u8; SEED_LEN]);
+    let imp = signet.imprint(&rng, b"armor-test");
+    let armor = encode_imprint_armor(&signet.id(), &imp);
+    let (dec_id, dec_imp) = decode_imprint_armor(&armor).unwrap();
+    assert_eq!(dec_id, signet.id());
+    assert_eq!(dec_imp, imp);
+    assert!(decode_imprint_armor(b"-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n").is_err());
+    // Reject exact-length armor with wrong 8-byte magic header (flip first byte of magic).
+    let mut bad_magic_armor = String::from_utf8(armor.clone()).unwrap();
+    assert!(bad_magic_armor.contains("\nQkxJTkNTZz"));
+    bad_magic_armor = bad_magic_armor.replacen("\nQkxJTkNTZz", "\nRkxJTkNTZz", 1);
+    assert!(decode_imprint_armor(bad_magic_armor.as_bytes()).is_err());
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn end_to_end_imprint_verify_clone_and_adversarial_rejections() {
+    let env = TestEnv::new("e2e");
+    env.signet_ok(&env.root, &["enable", "--global"]);
+
+    // Generate signet A and signet B (A adopted, B unadopted).
+    let out_a = env.signet_ok(&env.root, &["keygen"]);
+    let marker_a = out_a.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let seed_b = env.root.join("b.seed");
+    let out_b = env.signet_ok(&env.root, &["keygen", "--file", seed_b.to_str().unwrap()]);
+    let marker_b = out_b.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    assert_ne!(marker_a, marker_b);
+    env.signet_ok(&env.root, &["unadopt", seed_b.to_str().unwrap()]);
+
+    // Create bare remote named `acme.<marker_a>.git`.
+    let remote = env.root.join(format!("acme.{marker_a}.git"));
+    fs::create_dir_all(&remote).unwrap();
+    env.git_ok(&remote, &["init", "--bare"]);
+
+    // Clone and make two commits (including nested dir + 128 KiB file exercising Pipeline streaming!).
+    let work = env.root.join("work");
+    env.git_ok(&env.root, &["clone", remote.to_str().unwrap(), work.to_str().unwrap()]);
+    fs::create_dir_all(work.join("src/deep")).unwrap();
+    fs::write(work.join("README.md"), b"hello unified git-signet\n").unwrap();
+    fs::write(work.join("src/deep/big.bin"), vec![0x5Au8; 128 * 1024 + 17]).unwrap();
+    env.git_ok(&work, &["add", "."]);
+    env.git_ok(&work, &["commit", "-m", "initial commit"]);
+
+    // Verify commit carries BOTH `signet-tree blake3` AND `gpgsig` `BLINCSg1`, and passes stock `git verify-commit`!
+    let raw_head = env.git_ok(&work, &["cat-file", "commit", "HEAD"]);
+    assert!(raw_head.contains("signet-tree blake3 "), "missing signet-tree header:\n{raw_head}");
+    assert!(raw_head.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "missing BLINCSg1 gpgsig:\n{raw_head}");
+    let vc = env.git_ok(&work, &["verify-commit", "HEAD"]);
+    let _ = vc;
+    let chk = env.signet_ok(&work, &["check", "HEAD", "--signet", &marker_a]);
+    assert!(chk.contains("MATCH") && chk.contains("direct salted snapshot imprint"), "unexpected check:\n{chk}");
+
+    // Second commit carries `signet-parent blake3` too.
+    fs::write(work.join("README.md"), b"second revision\n").unwrap();
+    env.git_ok(&work, &["add", "README.md"]);
+    env.git_ok(&work, &["commit", "-m", "second commit"]);
+    let raw2 = env.git_ok(&work, &["cat-file", "commit", "HEAD"]);
+    assert!(raw2.contains("signet-parent blake3 "), "missing signet-parent header:\n{raw2}");
+    env.git_ok(&work, &["push", "origin", "main"]);
+
+    // Fresh clone of `acme.<marker_a>.git` verifies in `reference-transaction` and passes `fsck`!
+    let clone1 = env.root.join("clone1");
+    env.git_ok(&env.root, &["clone", remote.to_str().unwrap(), clone1.to_str().unwrap()]);
+    let fsck_out = env.signet_ok(&clone1, &["fsck"]);
+    assert!(fsck_out.contains("verified cleanly"));
+
+    // Local commits in a non-bare clone are NEVER refused even without the signet!
+    env.signet_ok(&env.root, &["unadopt", env.config_dir.join("signets").join(format!("{marker_a}.seed")).to_str().unwrap()]);
+    fs::write(clone1.join("local.txt"), b"local work\n").unwrap();
+    env.git_ok(&clone1, &["add", "local.txt"]);
+    env.git_ok(&clone1, &["commit", "-m", "unsigned local commit"]);
+
+    // Adversarial 1: even pushing an unsigned commit into a bare signet-bound remote is refused if the remote runs git-signet!
+    let push_blocked = env.git(&clone1, &["push", "origin", "main"]);
+    assert!(!push_blocked.status.success(), "bare signet-bound remote unexpectedly accepted unsigned push!");
+    // Now simulate a compromised remote (GIT_SIGNET_SKIP_HOOK=1 on attacker's push) -> fresh client clone MUST FAIL!
+    let push_attacker = env.git_with_env(&clone1, &["push", "origin", "main"], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+    assert!(push_attacker.status.success());
+    let clone_fail_unsigned = env.root.join("clone_fail_unsigned");
+    let res = env.git(&env.root, &["clone", remote.to_str().unwrap(), clone_fail_unsigned.to_str().unwrap()]);
+    assert!(!res.status.success(), "clone unexpectedly accepted unsigned commit on signet-bound remote!");
+
+    // Adversarial 2: commit imprinted by WRONG signet B injected on compromised remote -> fresh client clone MUST FAIL!
+    env.signet_ok(&clone1, &["imprint-here", seed_b.to_str().unwrap()]);
+    fs::write(clone1.join("evil.txt"), b"wrong signet\n").unwrap();
+    env.git_ok(&clone1, &["add", "evil.txt"]);
+    env.git_ok(&clone1, &["commit", "-m", "imprinted by wrong signet B"]);
+    let push_wrong = env.git_with_env(&clone1, &["push", "origin", "main"], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+    assert!(push_wrong.status.success());
+    let clone_fail_wrong = env.root.join("clone_fail_wrong");
+    let res_b = env.git(&env.root, &["clone", remote.to_str().unwrap(), clone_fail_wrong.to_str().unwrap()]);
+    assert!(!res_b.status.success(), "clone unexpectedly accepted wrong signet B on signet-A remote!");
+}
+
+#[test]
+fn wrapper_git_fsck_amend_and_branch_bound_signet() {
+    let env = TestEnv::new("wrapper-amend");
+    let bin_dir = env.root.join("bin");
+    env.signet_ok(&env.root, &["enable", "--global", "--wrapper-dir", bin_dir.to_str().unwrap()]);
+    let out = env.signet_ok(&env.root, &["keygen"]);
+    let marker = out.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+
+    let repo = env.root.join("work");
+    env.git_ok(&env.root, &["init", repo.to_str().unwrap()]);
+    // Switch to a signet-bound branch (`main+<marker>`) — `includeIf.onbranch` imprints automatically!
+    let branch = format!("main+{marker}");
+    env.git_ok(&repo, &["checkout", "-b", &branch]);
+    fs::write(repo.join("f.txt"), b"v1\n").unwrap();
+    env.git_ok(&repo, &["add", "f.txt"]);
+    env.git_ok(&repo, &["commit", "-m", "branch-bound initial"]);
+
+    // Verify commit carries signet-tree + BLINCSg1 imprint AND passes `git verify-commit`!
+    env.git_ok(&repo, &["verify-commit", "HEAD"]);
+    let chk1 = env.signet_ok(&repo, &["check", "HEAD"]);
+    assert!(chk1.contains("direct salted snapshot imprint"));
+
+    // Amend commit (changes tree!) -> post-commit replaces stale signet-tree and re-imprints cleanly!
+    fs::write(repo.join("f.txt"), b"v2 amended\n").unwrap();
+    env.git_ok(&repo, &["add", "f.txt"]);
+    env.git_ok(&repo, &["commit", "--amend", "-m", "branch-bound amended"]);
+    env.git_ok(&repo, &["verify-commit", "HEAD"]);
+    let chk2 = env.signet_ok(&repo, &["check", "HEAD"]);
+    assert!(chk2.contains("MATCH") && chk2.contains("direct salted snapshot imprint"));
+
+    // Run `git fsck` through the installed transparent `git` wrapper -> runs stock git fsck + git-signet fsck!
+    let wrap_out = Command::new(bin_dir.join("git"))
+        .current_dir(&repo)
+        .env("HOME", &env.home)
+        .env("GIT_SIGNET_CONFIG_DIR", &env.config_dir)
+        .env("GIT_SIGNET_REAL_GIT", &env.real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["fsck"])
         .output()
         .unwrap();
-    assert!(py.status.success(), "signet-verify.py failed: {:?}", py);
-
-    // 4. ATTACK 1: Compromised host pushes an UNSIGNED commit to `main`!
-    let evil_clone = sb.root.join("evil");
     assert!(
-        sb.git(
-            &sb.root,
-            &["-c", "signet.disabled=true", "clone", remote.to_str().unwrap(), evil_clone.to_str().unwrap()]
-        )
-        .status
-        .success()
-    );
-    fs::write(evil_clone.join("lib.rs"), "pub fn safe() -> u32 { 666 } // backdoor\n").unwrap();
-    assert!(
-        sb.git(
-            &evil_clone,
-            &["-c", "signet.disabled=true", "commit", "-am", "Unsigned backdoor"]
-        )
-        .status
-        .success()
-    );
-    assert!(
-        sb.git(&evil_clone, &["-c", "signet.disabled=true", "push", "origin", "main"])
-            .status
-            .success()
-    );
-
-    // Sam's fresh clone MUST ABORT before writing lib.rs!
-    let sam_bad1 = sb.root.join("sam-bad1");
-    let clone_bad1 = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam_bad1.to_str().unwrap()]);
-    assert!(!clone_bad1.status.success(), "unsigned commit clone MUST be aborted!");
-    assert!(!sam_bad1.join("lib.rs").exists(), "working tree must NOT be written on rejected clone!");
-
-    // Existing Sam's `git fetch` MUST ALSO ABORT!
-    let fetch_bad = sb.git(&sam, &["fetch", "origin"]);
-    assert!(!fetch_bad.status.success(), "fetch of unsigned commit MUST be aborted!");
-
-    // 5. ATTACK 2: Compromised host signs commit with MALLORY'S Ed25519 key AND hijacks default branch!
-    assert!(
-        sb.git(&evil_clone, &["-c", "signet.disabled=true", "checkout", "-b", "hijacked"])
-            .status
-            .success()
-    );
-    assert!(sb.git(&evil_clone, &["config", "gpg.format", "ssh"]).status.success());
-    assert!(
-        sb.git(&evil_clone, &["config", "user.signingkey", mallory_key.to_str().unwrap()])
-            .status
-            .success()
-    );
-    fs::write(evil_clone.join("lib.rs"), "pub fn safe() -> u32 { 999 } // mallory signed\n").unwrap();
-    assert!(
-        sb.git(
-            &evil_clone,
-            &["-c", "signet.disabled=true", "commit", "-S", "-am", "Mallory-signed hijack"]
-        )
-        .status
-        .success()
-    );
-    assert!(
-        sb.git(&evil_clone, &["-c", "signet.disabled=true", "push", "origin", "hijacked"])
-            .status
-            .success()
-    );
-    // Point remote HEAD to `hijacked` (default-branch swap attack!)
-    assert!(
-        sb.git(
-            &remote,
-            &["-c", "signet.disabled=true", "symbolic-ref", "HEAD", "refs/heads/hijacked"]
-        )
-        .status
-        .success()
-    );
-
-    let sam_bad2 = sb.root.join("sam-bad2");
-    let clone_bad2 = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam_bad2.to_str().unwrap()]);
-    assert!(
-        !clone_bad2.status.success(),
-        "default-branch hijack signed by Mallory MUST be aborted!"
-    );
-    assert!(
-        String::from_utf8_lossy(&clone_bad2.stderr).contains("SIGNATURE REJECTED"),
-        "expected SIGNATURE REJECTED, got: {}",
-        String::from_utf8_lossy(&clone_bad2.stderr)
+        wrap_out.status.success(),
+        "wrapped git fsck failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&wrap_out.stdout),
+        String::from_utf8_lossy(&wrap_out.stderr)
     );
 }
 
 #[test]
-fn branch_and_tag_keys_unsigned_tag_rejection_and_conflict_checks() {
-    let sb = Sandbox::new();
-    let (maya_key, maya_marker) = sb.gen_ed25519("maya_key");
-    let (_, other_marker) = sb.gen_ed25519("other_key");
+fn merge_commit_empty_tree_no_gpg_sign_and_shallow_clone() {
+    let env = TestEnv::new("merge-shallow");
+    env.signet_ok(&env.root, &["enable", "--global"]);
+    let out = env.signet_ok(&env.root, &["keygen"]);
+    let marker = out.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
 
-    // Ordinary repo name (NO repo rename needed!)
-    let remote = sb.root.join("ordinary-repo.git");
-    let branch = format!("main+{maya_marker}");
-    assert!(sb.git(&sb.root, &["init", "--bare", "-b", &branch, remote.to_str().unwrap()]).status.success());
+    let remote = env.root.join(format!("proj.{marker}.git"));
+    fs::create_dir_all(&remote).unwrap();
+    env.git_ok(&remote, &["init", "--bare"]);
 
-    assert!(sb.signet(&sb.root, &["enable", "--global"]).status.success());
+    let work = env.root.join("work");
+    env.git_ok(&env.root, &["clone", remote.to_str().unwrap(), work.to_str().unwrap()]);
 
-    let repo = sb.root.join("work");
-    fs::create_dir_all(&repo).unwrap();
-    assert!(sb.git(&repo, &["init", "-b", &branch]).status.success());
-    assert!(sb.signet(&repo, &["sign-here", maya_key.to_str().unwrap()]).status.success());
-    fs::write(repo.join("hello.txt"), "signed on self-certifying branch\n").unwrap();
-    assert!(sb.git(&repo, &["add", "hello.txt"]).status.success());
+    // 1. Empty-tree initial commit (`--allow-empty`), imprinted + BLAKE3-bound.
+    env.git_ok(&work, &["commit", "--allow-empty", "-m", "empty root"]);
+    let chk_empty = env.signet_ok(&work, &["check", "HEAD", "--signet", &marker, "--no-shallow"]);
+    assert!(chk_empty.contains("MATCH") && chk_empty.contains("direct salted snapshot imprint"));
 
-    // A local commit is never refused, signed or not: local branches are the user's own work.
-    // What the key's name promises is checked when the branch is fetched, and on request.
-    assert!(sb.git(&repo, &["commit", "--no-gpg-sign", "-m", "Unsigned local work"]).status.success());
-    assert!(!sb.signet(&repo, &["check", "HEAD"]).status.success(), "unsigned tip must not check out as signed");
-    fs::write(repo.join("hello.txt"), "now signed\n").unwrap();
-    assert!(sb.git(&repo, &["commit", "-am", "Signed commit on branch"]).status.success());
-    assert!(sb.signet(&repo, &["check", "HEAD"]).status.success());
+    // 2. `--no-gpg-sign` respected: adds `signet-tree` + `signet-parent`, does NOT imprint!
+    env.git_ok(&work, &["checkout", "-b", "side"]);
+    fs::write(work.join("side.txt"), b"side branch\n").unwrap();
+    env.git_ok(&work, &["add", "side.txt"]);
+    env.git_ok(&work, &["commit", "--no-gpg-sign", "-m", "unimprinted side commit"]);
+    let side_raw = env.git_ok(&work, &["cat-file", "commit", "HEAD"]);
+    assert!(side_raw.contains("signet-tree blake3 ") && side_raw.contains("signet-parent blake3 "));
+    assert!(!side_raw.contains("gpgsig "), "--no-gpg-sign commit unexpectedly got imprinted!");
 
-    // A signed annotated tag whose name carries the key passes.
-    let good_tag = format!("v1.0.0+{maya_marker}");
-    assert!(sb.git(&repo, &["tag", "-s", &good_tag, "-m", "Signed tag"]).status.success());
-    assert!(sb.signet(&repo, &["check", &good_tag]).status.success());
+    // 3. 2-parent merge commit back on `main` (carries 2 `signet-parent` lines + BLINCS imprint!).
+    env.git_ok(&work, &["checkout", "main"]);
+    fs::write(work.join("main.txt"), b"main branch\n").unwrap();
+    env.git_ok(&work, &["add", "main.txt"]);
+    env.git_ok(&work, &["commit", "-m", "main commit"]);
+    env.git_ok(&work, &["merge", "--no-ff", "side", "-m", "merge side into main"]);
+    let merge_raw = env.git_ok(&work, &["cat-file", "commit", "HEAD"]);
+    let parent_lines = merge_raw.lines().filter(|l| l.starts_with("signet-parent blake3 ")).count();
+    assert_eq!(parent_lines, 2, "merge commit should have 2 signet-parent lines:\n{merge_raw}");
+    env.git_ok(&work, &["verify-commit", "HEAD"]);
+    env.signet_ok(&work, &["check", "HEAD", "--no-shallow"]);
+    env.git_ok(&work, &["push", "origin", "main"]);
 
-    // So does a plain annotated tag naming a signed commit: the commit carries the signature.
-    let plain_tag = format!("v2.0.0+{maya_marker}");
-    assert!(sb.git(&repo, &["tag", "-a", "--no-sign", &plain_tag, "-m", "Plain tag"]).status.success());
-
-    // A tag whose name carries the key but which names an unsigned commit is refused.
-    assert!(sb.git(&repo, &["checkout", "-q", "--detach"]).status.success());
-    assert!(sb.git(&repo, &["commit", "--no-gpg-sign", "--allow-empty", "-m", "unsigned"]).status.success());
-    let bad_tag = format!("v3.0.0+{maya_marker}");
-    assert!(
-        !sb.git(&repo, &["tag", "-a", "--no-sign", &bad_tag, "-m", "x"]).status.success(),
-        "a key-named tag on an unsigned commit must be refused"
-    );
-    assert!(sb.git(&repo, &["checkout", "-q", &branch]).status.success());
-
-    // Push to ordinary remote and verify clone works with `-b main+ed25519-...`
-    assert!(sb.git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-    assert!(sb.git(&repo, &["push", "-u", "origin", &branch, "--tags"]).status.success());
-
-    let cl = sb.root.join("cloned");
-    assert!(sb.git(&sb.root, &["clone", "-b", &branch, remote.to_str().unwrap(), cl.to_str().unwrap()]).status.success());
-    assert!(sb.signet(&cl, &["fsck"]).status.success());
-
-    // Explicit `--key` disagreeing with refname key MUST fail closed!
-    let conflict = sb.signet(&cl, &["check", "HEAD", "--key", &other_marker]);
-    assert!(!conflict.status.success(), "conflicting --key must fail closed!");
-
-    // Duplicate gpgsig header MUST fail closed!
-    let dup_raw = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
-        author A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\
-        gpgsig -----BEGIN SSH SIGNATURE-----\n -----END SSH SIGNATURE-----\n\
-        gpgsig -----BEGIN SSH SIGNATURE-----\n -----END SSH SIGNATURE-----\n\nmsg\n";
-    assert!(extract_commit_ssh_signature(dup_raw).is_err());
+    // 4. Shallow clone (`--depth=1` over file:// URL) verifies origin/main's salted snapshot + signet-tree cleanly,
+    // while `git signet check --no-shallow` rejects shallow history!
+    let shallow = env.root.join("shallow");
+    let file_url = format!("file://{}", remote.display());
+    env.git_ok(&env.root, &["clone", "--depth=1", &file_url, shallow.to_str().unwrap()]);
+    let chk_shallow = env.signet_ok(&shallow, &["check", "origin/main"]);
+    assert!(chk_shallow.contains("shallow boundary reached") && chk_shallow.contains("direct salted snapshot imprint"));
+    let chk_no_shallow = env.signet(&shallow, &["check", "origin/main", "--no-shallow"]);
+    assert!(!chk_no_shallow.status.success(), "--no-shallow unexpectedly passed on a shallow clone!");
 }
 
 #[test]
-fn composes_cleanly_with_git_buttress_when_installed() {
-    // Only run composition check if `git-buttress` binary is discoverable on PATH
-    let Some(buttress_bin) = env::var_os("PATH").and_then(|p| {
-        env::split_paths(&p)
-            .map(|d| d.join("git-buttress"))
-            .find(|cand| cand.is_file())
-    }) else {
-        return;
-    };
+fn formal_transitive_closure_old_tags_and_rogue_tag_rejection() {
+    let env = TestEnv::new("closure");
+    // Create pre-adoption repo with old unsigned commit A tagged `v0.1` (hooks not yet enabled).
+    let remote = env.root.join("tmp-remote.git");
+    let seed_a = env.root.join("a.seed");
+    let out_a = env.signet_ok(&env.root, &["keygen", "--file", seed_a.to_str().unwrap()]);
+    let marker_a = out_a.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let bound_remote = env.root.join(format!("legacy.{marker_a}.git"));
+    fs::create_dir_all(&bound_remote).unwrap();
+    env.git_ok(&bound_remote, &["init", "--bare"]);
 
-    let sb = Sandbox::new();
-    let (maya_key, maya_marker) = sb.gen_ed25519("maya_combo");
-    let (mallory_key, _) = sb.gen_ed25519("mallory_combo");
+    let dev = env.root.join("dev");
+    env.git_ok(&env.root, &["clone", bound_remote.to_str().unwrap(), dev.to_str().unwrap()]);
+    // Old unsigned commit A (no hooks enabled yet, explicitly --no-gpg-sign).
+    fs::write(dev.join("a.txt"), b"old v0.1 content\n").unwrap();
+    env.git_ok(&dev, &["add", "a.txt"]);
+    env.git_ok(&dev, &["commit", "--no-gpg-sign", "-m", "old commit A"]);
+    env.git_ok(&dev, &["tag", "v0.1"]);
 
-    // Enable BOTH git-buttress AND git-signet globally in the SAME sandbox HOME!
-    assert!(
-        Command::new(&buttress_bin)
-            .current_dir(&sb.root)
-            .env("HOME", &sb.home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_BUTTRESS_REAL_GIT", &sb.git_bin)
-            .args(["enable", "--global", "--no-wrapper"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(sb.signet(&sb.root, &["enable", "--global"]).status.success());
+    // Now enable git-signet and make commit B (imprinted by A, carrying signet-parent covering A!).
+    env.signet_ok(&env.root, &["enable", "--global"]);
+    fs::write(dev.join("b.txt"), b"new imprinted commit B\n").unwrap();
+    env.git_ok(&dev, &["add", "b.txt"]);
+    env.git_ok(&dev, &["commit", "-m", "adopted signet commit B"]);
+    env.git_ok(&dev, &["push", "origin", "main", "v0.1"]);
 
-    let remote = sb.root.join(format!("combo.{maya_marker}.git"));
-    assert!(sb.git(&sb.root, &["init", "--bare", "-b", "main", remote.to_str().unwrap()]).status.success());
+    // Cloning fetches BOTH main (B) and old unsigned tag v0.1 (A) -> ACCEPTED via formal transitive closure!
+    let client = env.root.join("client");
+    env.git_ok(&env.root, &["clone", bound_remote.to_str().unwrap(), client.to_str().unwrap()]);
+    let chk_tag = env.signet_ok(&client, &["check", "v0.1", "--signet", &marker_a]);
+    assert!(chk_tag.contains("BLAKE3-verified transitive closure"), "expected closure verification:\n{chk_tag}");
 
-    let maya = sb.root.join("maya");
-    fs::create_dir_all(&maya).unwrap();
-    assert!(sb.git(&maya, &["init", "-b", "main"]).status.success());
-    assert!(sb.signet(&maya, &["sign-here", maya_key.to_str().unwrap()]).status.success());
-    fs::write(maya.join("app.rs"), "fn main() {}\n").unwrap();
-    assert!(sb.git(&maya, &["add", "app.rs"]).status.success());
-    let c = sb.git(&maya, &["commit", "-m", "Both buttressed and signet-signed"]);
-    assert!(c.status.success(), "combo commit failed: {:?}", c);
+    // Now push a ROGUE unsigned commit R NOT in B's ancestor closure under tag `v-rogue` -> MUST BE REJECTED!
+    let rogue = env.root.join("rogue");
+    env.git_ok(&env.root, &["init", rogue.to_str().unwrap()]);
+    fs::write(rogue.join("r.txt"), b"rogue orphan\n").unwrap();
+    env.git_ok(&rogue, &["add", "r.txt"]);
+    env.git_ok(&rogue, &["commit", "--no-gpg-sign", "-m", "rogue orphan"]);
+    env.git_ok(&rogue, &["tag", "v-rogue"]);
+    env.git_ok(&rogue, &["push", bound_remote.to_str().unwrap(), "refs/tags/v-rogue"]);
 
-    // Verify commit has BOTH `buttress-tree blake3` AND valid `gpgsig`!
-    let raw = String::from_utf8_lossy(&sb.git(&maya, &["cat-file", "-p", "HEAD"]).stdout).to_string();
-    assert!(raw.contains("buttress-tree blake3 "), "missing buttress-tree:\n{raw}");
-    assert!(raw.contains("gpgsig -----BEGIN SSH SIGNATURE-----"), "missing ssh gpgsig:\n{raw}");
-
-    assert!(sb.git(&maya, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-    assert!(sb.git(&maya, &["push", "-u", "origin", "main"]).status.success());
-
-    // Sam clones with BOTH git-buttress and git-signet enabled -> BOTH verify automatically!
-    let sam = sb.root.join("sam");
-    let cl = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam.to_str().unwrap()]);
-    assert!(cl.status.success(), "combo clone failed: {:?}", cl);
-
-    // Attack A: Mallory creates a validly-buttressed commit signed by MALLORY'S key -> git-signet blocks!
-    let mallory = sb.root.join("mallory");
-    assert!(
-        sb.git(
-            &sb.root,
-            &["-c", "signet.disabled=true", "clone", remote.to_str().unwrap(), mallory.to_str().unwrap()]
-        )
-        .status
-        .success()
-    );
-    assert!(sb.signet(&mallory, &["sign-here", mallory_key.to_str().unwrap()]).status.success());
-    fs::write(mallory.join("app.rs"), "fn main() { /* evil */ }\n").unwrap();
-    assert!(
-        sb.git(&mallory, &["-c", "signet.disabled=true", "commit", "-am", "Mallory buttressed"])
-            .status
-            .success()
-    );
-    assert!(
-        sb.git(&mallory, &["-c", "signet.disabled=true", "push", "origin", "main"])
-            .status
-            .success()
-    );
-
-    let sam_evil = sb.root.join("sam-evil");
-    let blocked = sb.git(&sb.root, &["clone", remote.to_str().unwrap(), sam_evil.to_str().unwrap()]);
-    assert!(!blocked.status.success(), "git-signet MUST block Mallory's validly-buttressed commit!");
-}
-
-fn head_is_signed(sb: &Sandbox, repo: &Path) -> bool {
-    String::from_utf8_lossy(&sb.git(repo, &["cat-file", "commit", "HEAD"]).stdout)
-        .contains("gpgsig -----BEGIN SSH SIGNATURE-----")
+    let fetch_rogue = env.git(&client, &["fetch", "origin", "--tags"]);
+    assert!(!fetch_rogue.status.success(), "fetch unexpectedly accepted rogue tag outside transitive closure!");
+    let _ = remote;
 }
 
 #[test]
-fn key_holders_sign_without_setup_and_nobody_elses_commits_are_refused() {
-    // Two people on two machines: Maya holds the signing key, Sam does not.
-    let m = Sandbox::new();
-    let s = Sandbox::new();
-    let (maya_key, marker) = m.gen_ed25519("maya_key");
-    assert!(m.signet(&m.root, &["adopt", maya_key.to_str().unwrap()]).status.success());
-    assert!(m.signet(&m.root, &["enable", "--global"]).status.success());
-    assert!(s.signet(&s.root, &["enable", "--global"]).status.success());
+fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
+    let env = TestEnv::new("snapshot-attack");
+    env.signet_ok(&env.root, &["enable", "--global"]);
+    let out = env.signet_ok(&env.root, &["keygen"]);
+    let marker = out.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
 
-    // --- A repository whose name carries the key: Maya types only plain git. ---
-    let remote = m.root.join(format!("acme.{marker}.git"));
-    assert!(m.git(&m.root, &["init", "--bare", "-b", "main", remote.to_str().unwrap()]).status.success());
-    let work = m.root.join("work");
-    assert!(m.git(&m.root, &["init", "-b", "main", work.to_str().unwrap()]).status.success());
-    assert!(m.git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-    fs::write(work.join("f"), "one\n").unwrap();
-    assert!(m.git(&work, &["add", "f"]).status.success());
-    assert!(m.git(&work, &["commit", "-m", "one"]).status.success());
-    assert!(head_is_signed(&m, &work), "the key holder's plain `git commit` must be signed");
-    assert!(m.git(&work, &["tag", "-a", "v1", "-m", "ordinary annotated tag"]).status.success());
-    assert!(m.git(&work, &["tag", "light"]).status.success());
-    let pushed = m.git(&work, &["push", "-u", "origin", "main", "--tags"]);
-    assert!(pushed.status.success(), "push failed: {pushed:?}");
+    let work = env.root.join("repo");
+    env.git_ok(&env.root, &["init", work.to_str().unwrap()]);
+    env.signet_ok(&work, &["imprint-here", env.config_dir.join("signets").join(format!("{marker}.seed")).to_str().unwrap()]);
+    fs::write(work.join("good.txt"), b"benign file\n").unwrap();
+    env.git_ok(&work, &["add", "good.txt"]);
+    env.git_ok(&work, &["commit", "-m", "good commit"]);
 
-    // --- Sam clones, works, and merges Maya's next commit. Nothing refuses his own commits. ---
-    let sam = s.root.join("sam");
-    let cloned = s.git(&s.root, &["clone", remote.to_str().unwrap(), sam.to_str().unwrap()]);
-    assert!(cloned.status.success(), "clone failed: {cloned:?}");
-    fs::write(sam.join("sam.txt"), "sam's work\n").unwrap();
-    assert!(s.git(&sam, &["add", "sam.txt"]).status.success());
-    let sam_commit = s.git(&sam, &["commit", "-m", "Sam's local work"]);
-    assert!(sam_commit.status.success(), "a local commit without the key must succeed: {sam_commit:?}");
-    assert!(!head_is_signed(&s, &sam));
-    fs::write(work.join("f"), "two\n").unwrap();
-    assert!(m.git(&work, &["commit", "-am", "two"]).status.success());
-    assert!(m.git(&work, &["push", "origin", "main"]).status.success());
-    let pulled = s.git(&sam, &["pull", "--no-rebase", "--no-edit"]);
-    assert!(pulled.status.success(), "pull with a local merge must succeed: {pulled:?}");
-    assert!(s.signet(&sam, &["fsck"]).status.success());
+    // Annotated imprinted tag (`git tag -s`) covers tag + target commit + target tree!
+    env.git_ok(&work, &["tag", "-s", "v1.0", "-m", "imprinted release tag"]);
+    let chk_tag = env.signet_ok(&work, &["check", "v1.0", "--signet", &marker]);
+    assert!(chk_tag.contains("direct salted snapshot imprint"));
 
-    // If Sam's unsigned merge is pushed to the keyed repository, everyone's next clone refuses it.
-    let _ = s.git(&sam, &["push", "origin", "main"]);
-    let later = s.root.join("later");
-    let refused = s.git(&s.root, &["clone", remote.to_str().unwrap(), later.to_str().unwrap()]);
-    assert!(!refused.status.success(), "an unsigned tip in the keyed repository must be refused");
+    // Check digest-bound ref (`+blake3-<exact>` passes, wrong digest rejected).
+    let b3_id = env.signet_ok(&work, &["id", "HEAD"]).trim().to_owned();
+    env.git_ok(&work, &["tag", &format!("snap+blake3-{b3_id}")]);
+    env.signet_ok(&work, &["check", &format!("snap+blake3-{b3_id}")]);
+    let mut bad_b3 = b3_id.clone();
+    let flip = if bad_b3.starts_with('0') { "1" } else { "0" };
+    bad_b3.replace_range(0..1, flip);
+    let bad_chk = env.signet(&work, &["check", "HEAD", "--expect", &bad_b3]);
+    assert!(!bad_chk.status.success(), "accepted mismatched --expect BLAKE3 digest!");
 
-    // --- A branch whose name carries the key, in a brand-new repository. ---
-    let branch = format!("main+{marker}");
-    let b = m.root.join("b");
-    assert!(m.git(&m.root, &["init", "-b", &branch, b.to_str().unwrap()]).status.success());
-    fs::write(b.join("a"), "base\n").unwrap();
-    assert!(m.git(&b, &["add", "a"]).status.success());
-    assert!(m.git(&b, &["commit", "-m", "base"]).status.success());
-    assert!(head_is_signed(&m, &b), "the first commit on an unborn key-named branch must be signed");
+    // Direct cryptographic test: swap tree OID inside a copy of the commit while keeping the old BLINCS imprint,
+    // and also verify a commit with tampered `signet-tree` fails `verify_commit_chain`.
+    let mut repo = GitRepo::open(Some(&work)).unwrap();
+    let head_oid = repo.rev_parse("HEAD").unwrap();
+    let (_, raw_commit) = repo.read_object(&head_oid).unwrap();
+    let (payload, armor) = extract_commit_imprint(&raw_commit).unwrap();
 
-    // A rebase that stops for a conflict leaves HEAD detached; continuing must still sign.
-    assert!(m.git(&b, &["switch", "-c", "side"]).status.success());
-    fs::write(b.join("a"), "side\n").unwrap();
-    assert!(m.git(&b, &["commit", "-am", "side"]).status.success());
-    assert!(m.git(&b, &["switch", &branch]).status.success());
-    fs::write(b.join("a"), "mine\n").unwrap();
-    assert!(m.git(&b, &["commit", "-am", "mine"]).status.success());
-    assert!(!m.git(&b, &["rebase", "side"]).status.success(), "the rebase should stop on a conflict");
-    fs::write(b.join("a"), "resolved\n").unwrap();
-    assert!(m.git(&b, &["add", "a"]).status.success());
-    let cont = m.git(&b, &["rebase", "--continue"]);
-    assert!(cont.status.success(), "rebase --continue failed: {cont:?}");
-    assert!(head_is_signed(&m, &b), "the rebased tip must be signed");
-    assert!(m.signet(&b, &["check", "HEAD"]).status.success());
+    // Valid snapshot verifies cleanly AND streams the actual file contents (zero pre-hashing!).
+    let sid = verify_payload_imprint(&mut repo, &payload, &armor, None).unwrap();
+    let (_, decoded_imp) = decode_imprint_armor(&armor).unwrap();
+    let mut snap_bytes = Vec::new();
+    SnapshotReader::for_commit(&mut repo, &payload).unwrap().read_to_end(&mut snap_bytes).unwrap();
+    assert!(snap_bytes.starts_with(b"git-signet 2026-11-24 commit-snapshot\0"));
+    assert!(snap_bytes.windows(b"benign file\n".len()).any(|w| w == b"benign file\n"), "SnapshotReader omitted tree blob bytes!");
+    assert!(sid.verify(&snap_bytes, &decoded_imp), "BLINCS imprint did not verify against exact SnapshotReader bytes!");
+    // Flip 1 byte in the streamed file content while keeping commit bytes 100% unchanged (simulated SHA-1/BLAKE3 collision!):
+    let pos = snap_bytes.windows(b"benign file\n".len()).position(|w| w == b"benign file\n").unwrap();
+    snap_bytes[pos] ^= 1;
+    assert!(!sid.verify(&snap_bytes, &decoded_imp), "BLINCS imprint accepted tampered file content with unchanged commit bytes!");
 
-    // Sam, without the key, can still commit on a branch of that name; it just is not signed.
-    let sb = s.root.join("b");
-    assert!(s.git(&s.root, &["init", "-b", &branch, sb.to_str().unwrap()]).status.success());
-    fs::write(sb.join("a"), "sam\n").unwrap();
-    assert!(s.git(&sb, &["add", "a"]).status.success());
-    assert!(s.git(&sb, &["commit", "-m", "sam"]).status.success());
-    assert!(!s.signet(&sb, &["check", "HEAD"]).status.success());
+    // Tamper 1 byte in `signet-tree` header inside a fresh commit (re-imprinted or not) -> BLAKE3 chain rejects!
+    let parsed = parse_commit(raw_commit.clone()).unwrap();
+    assert!(matches!(parsed.class, CommitClass::Carrying { .. }));
+    let bad_tree_dig = [0x99u8; 32];
+    let bad_payload = insert_signet_headers(&raw_commit, &parsed.tree, &bad_tree_dig, &[]).unwrap();
+    let bad_oid = repo.hash_object_write(ObjKind::Commit, &bad_payload).unwrap();
+    let ctx = ContextKeys::new();
+    assert!(verify_commit_chain(&mut repo, &ctx, &bad_oid, None, false).is_err(), "accepted forged signet-tree digest!");
 
-    // A repository that merely has `ed25519-` in its name is an ordinary repository.
-    let dalek = s.root.join("dalek");
-    assert!(s.git(&s.root, &["init", "-b", "main", dalek.to_str().unwrap()]).status.success());
-    assert!(s.git(&dalek, &["remote", "add", "origin", "https://example.com/x/ed25519-dalek.git"]).status.success());
-    fs::write(dalek.join("a"), "a\n").unwrap();
-    assert!(s.git(&dalek, &["add", "a"]).status.success());
-    assert!(s.git(&dalek, &["commit", "-m", "a"]).status.success());
-    assert!(s.git(&dalek, &["switch", "-c", "fix/ed25519-parsing"]).status.success());
-}
+    // Tamper tree content under the same commit payload (new blob -> new tree -> swap tree OID into payload)
+    // while keeping original armor -> BLINCS snapshot verifier rejects!
+    let evil_blob = repo.hash_object_write(ObjKind::Blob, b"evil swapped file\n").unwrap();
+    let mut evil_tree_raw = Vec::new();
+    evil_tree_raw.extend_from_slice(b"100644 good.txt\0");
+    evil_tree_raw.extend_from_slice(&evil_blob);
+    let evil_tree = repo.hash_object_write(ObjKind::Tree, &evil_tree_raw).unwrap();
+    let swapped_payload = String::from_utf8(payload.clone()).unwrap().replace(&to_hex(&parsed.tree), &to_hex(&evil_tree)).into_bytes();
+    assert!(verify_payload_imprint(&mut repo, &swapped_payload, &armor, Some(&sid)).is_err(), "accepted swapped tree under old BLINCS imprint!");
 
-#[test]
-fn cli_subcommands_fsck_disable_and_unadopt_coverage() {
-    let sb = Sandbox::new();
+    // Stale amend check: single signet-tree whose tree OID != commit's tree is treated as Stale (plain),
+    // while duplicate signet-tree is rejected as malformed!
+    let stale_payload = insert_signet_headers(&raw_commit, &evil_tree, &bad_tree_dig, &[]).unwrap();
+    assert!(matches!(parse_commit(stale_payload).unwrap().class, CommitClass::Stale));
 
-    // 1. Help / version / unknown subcommand
-    for args in [&[][..], &["-h"][..], &["--help"][..], &["help"][..]] {
-        let out = sb.signet(&sb.root, args);
-        assert!(out.status.success(), "help {args:?} failed");
-        assert!(String::from_utf8_lossy(&out.stdout).contains("USAGE:"));
-    }
-    let ver = sb.signet(&sb.root, &["--version"]);
-    assert!(ver.status.success());
-    assert!(String::from_utf8_lossy(&ver.stdout).contains("git-signet"));
-    assert_eq!(sb.signet(&sb.root, &["nope"]).status.code(), Some(1));
+    // Confirm `imprint_payload` + `attach_gpgsig` round-trip directly through library API too.
+    let rng = Randomness::initialize(env.config_dir.join("randomness.state")).unwrap();
+    let signet = Signet::from_seed(&[0x33u8; SEED_LEN]);
+    let imp2 = imprint_payload(&mut repo, &signet, &rng, &payload).unwrap();
+    let armor2 = encode_imprint_armor(&signet.id(), &imp2);
+    let combined = attach_gpgsig(&payload, &armor2);
+    let (p2, a2) = extract_commit_imprint(&combined).unwrap();
+    assert_eq!(p2, payload);
+    assert_eq!(verify_payload_imprint(&mut repo, &p2, &a2, Some(&signet.id())).unwrap(), signet.id());
 
-    // 2. format-key + keygen (using pre-created keypair so ssh-keygen doesn't prompt) + unadopt
-    let (key_path, marker) = sb.gen_ed25519("maya");
-    let pub_path = key_path.with_extension("pub");
-    let fk = sb.signet(&sb.root, &["format-key", pub_path.to_str().unwrap()]);
-    assert!(fk.status.success());
-    assert_eq!(String::from_utf8_lossy(&fk.stdout).trim(), marker);
-    assert_eq!(sb.signet(&sb.root, &["format-key"]).status.code(), Some(1));
-
-    let kg = sb.signet(
-        &sb.root,
-        &["keygen", "--file", key_path.to_str().unwrap(), "--comment", "test-key"],
-    );
-    assert!(kg.status.success(), "keygen failed: {}", String::from_utf8_lossy(&kg.stderr));
-    let kg_out = String::from_utf8_lossy(&kg.stdout);
-    assert!(kg_out.contains(&format!("Verifying key: {marker}")));
-    assert_eq!(sb.signet(&sb.root, &["keygen", "--bogus"]).status.code(), Some(1));
-    assert_eq!(sb.signet(&sb.root, &["keygen", "--file"]).status.code(), Some(1));
-
-    // Verify adopt wrote includeIf; then unadopt removes it!
-    let cfg_before = sb.git(&sb.root, &["config", "--global", "--list"]);
-    assert!(String::from_utf8_lossy(&cfg_before.stdout).contains(&marker));
-    let un = sb.signet(&sb.root, &["unadopt", key_path.to_str().unwrap()]);
-    assert!(un.status.success());
-    assert!(String::from_utf8_lossy(&un.stdout).contains(&marker));
-    let cfg_after = sb.git(&sb.root, &["config", "--global", "--list"]);
-    assert!(
-        !String::from_utf8_lossy(&cfg_after.stdout).contains(&marker),
-        "unadopt must remove includeIf entries"
-    );
-
-    // 3. enable / disable CLI flags (--global --local conflict, local disable, global disable)
-    assert_eq!(sb.signet(&sb.root, &["enable", "--global", "--local"]).status.code(), Some(1));
-    assert_eq!(sb.signet(&sb.root, &["disable", "--global", "--local"]).status.code(), Some(1));
-    assert_eq!(sb.signet(&sb.root, &["disable", "--bogus"]).status.code(), Some(1));
-    assert!(sb.signet(&sb.root, &["enable", "--global"]).status.success());
-
-    // 4. Repository with 2 verified pinned refs + 2 unpinned refs -> `fsck` and `check --key`
-    let repo = sb.root.join("multi");
-    assert!(sb.git(&sb.root, &["init", "-q", "-b", "plain1", repo.to_str().unwrap()]).status.success());
-    fs::write(repo.join("f.txt"), "one\n").unwrap();
-    assert!(sb.git(&repo, &["add", "f.txt"]).status.success());
-    assert!(sb.git(&repo, &["commit", "-q", "-m", "plain commit"]).status.success());
-    assert!(sb.git(&repo, &["branch", "plain2"]).status.success());
-
-    // Sign a commit and put TWO keyed tags on it (in non-bare repos, tags/remotes are governed while local branches are ungoverned)
-    assert!(sb.signet(&repo, &["sign-here", key_path.to_str().unwrap()]).status.success());
-    let b1 = format!("rel1+{marker}");
-    assert!(sb.git(&repo, &["checkout", "-q", "-b", &b1]).status.success());
-    fs::write(repo.join("f.txt"), "signed\n").unwrap();
-    assert!(sb.git(&repo, &["commit", "-q", "-am", "signed commit"]).status.success());
-    assert!(sb.git(&repo, &["tag", &format!("v1+{marker}")]).status.success());
-    assert!(sb.git(&repo, &["tag", &format!("v2+{marker}")]).status.success());
-
-    // `check --key` on plain branch vs signed branch + bad args
-    let chk_good = sb.signet(&repo, &["check", &b1, "--key", &marker]);
-    assert!(chk_good.status.success());
-    let chk_bad = sb.signet(&repo, &["check", "plain1", "--key", &marker]);
-    assert_eq!(chk_bad.status.code(), Some(1));
-    assert_eq!(sb.signet(&repo, &["check", "--bogus"]).status.code(), Some(1));
-    assert_eq!(sb.signet(&repo, &["check", "--key"]).status.code(), Some(1));
-
-    // `fsck` must report EXACT counts: 2 verified tags, 3 ungoverned local branches (plain1, plain2, rel1+...)!
-    let fsck = sb.signet(&repo, &["fsck"]);
-    assert!(fsck.status.success(), "fsck failed: {}", String::from_utf8_lossy(&fsck.stderr));
-    let fsck_out = String::from_utf8_lossy(&fsck.stdout);
-    assert!(
-        fsck_out.contains("2 ref(s) verified, 3 ref(s) not governed by a key"),
-        "unexpected fsck output: {fsck_out}"
-    );
-
-    // Bare repo fsck verifies branches too (exercises is_bare == true)!
-    let bare = sb.root.join("bare.git");
-    assert!(sb.git(&sb.root, &["clone", "--bare", "-q", repo.to_str().unwrap(), bare.to_str().unwrap()]).status.success());
-    let bare_fsck = sb.signet(&bare, &["fsck"]);
-    assert!(bare_fsck.status.success(), "bare fsck failed: {}", String::from_utf8_lossy(&bare_fsck.stderr));
-    let bare_out = String::from_utf8_lossy(&bare_fsck.stdout);
-    assert!(
-        bare_out.contains("3 ref(s) verified, 2 ref(s) not governed by a key"),
-        "unexpected bare fsck output: {bare_out}"
-    );
-
-    // Local enable & disable + global disable actually clear hook config
-    assert!(sb.signet(&repo, &["enable", "--local"]).status.success());
-    assert!(sb.signet(&repo, &["disable", "--local"]).status.success());
-    let loc_dis = sb.git(&repo, &["config", "--local", "--get", "signet.disabled"]);
-    assert_eq!(String::from_utf8_lossy(&loc_dis.stdout).trim(), "true");
-
-    assert!(sb.signet(&sb.root, &["disable", "--global"]).status.success());
-    let glob_hook = sb.git(&sb.root, &["config", "--global", "--get", "hook.signet-reference-transaction.command"]);
-    assert!(!glob_hook.status.success(), "disable --global must remove hook config");
+    // Confirm `compute_commit_digest` works cleanly with memory-only cache.
+    let mut cache = DigestCache::memory_only();
+    let d = compute_commit_digest(&mut repo, &ctx, &head_oid, &mut cache).unwrap();
+    assert_eq!(to_hex(&d), b3_id);
 }

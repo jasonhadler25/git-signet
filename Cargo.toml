@@ -1,20 +1,40 @@
 [package]
 name = "git-signet"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Ed25519 verifying keys carried in Git repository, branch, and tag names"
-license = "MIT OR Apache-2.0"
+description = "Self-certifying BLINCS signet IDs and BLAKE3 tree/history binding for Git (pre-1.0 experimental)"
 repository = "https://github.com/jasonhadler25/git-signet"
+license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
+readme = "README.md"
 
 [[bin]]
 name = "git-signet"
 path = "src/main.rs"
 
-# Intentionally ZERO external crates!
-# Cryptographic verification delegates to OpenSSH `ssh-keygen -Y verify` over standard
-# Git SSH signatures (`gpg.format = ssh`), keeping the build-time and runtime supply chain minimal.
 [dependencies]
+blake3-servil = "=0.10.0"
+blincs = { git = "https://github.com/jasonhadler25/blincs", rev = "38bbc96807ecc5a6d67493b785d15d013dc5a510" }
 
-[profile.release]
+[profile.test]
 opt-level = 3
-strip = "symbols"
+codegen-units = 16
+incremental = false
+debug = false
+debug-assertions = true
+overflow-checks = true
+
+[profile.mutants]
+inherits = "release"
+incremental = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

@@ -1,160 +1,153 @@
-# git signet
+# git-signet Specification (v0.3.0, Pre-1.0)
 
-**Draft, 2026-11-22.**
+> **Pre-1.0 — Experimental & Unsupported.** This specification is not yet frozen and may change incompatibly before 1.0.
 
-## 1. What it is
+This document defines every byte format, domain-separation string, name grammar, and verification rule implemented by `git-signet`.
 
-Stock Git can sign commits and tags with an SSH Ed25519 key. What it lacks is
-a way for someone cloning a repository to know which key is supposed to have
-signed it, short of keyrings and per-repository `allowed_signers` files.
+---
 
-git signet puts the 32-byte verifying key into a name that users already
-copy and paste:
+## 1. Signet IDs and Digest Pins in Git Names
 
-1. the repository's name, in the URL they clone
-   (`acme-tls.ed25519-<52-base32>`), or
-2. a branch or tag name (`main+ed25519-<52-base32>`).
+### 1.1 Signet ID encoding (`blincs-<52>`)
+A BLINCS `SignetId` is 32 bytes (256 bits). Its canonical text encoding is:
+- Prefix: `blincs-` (7 ASCII bytes)
+- Payload: 52 characters of **unpadded lowercase RFC 4648 base32** (`a-z`, `2-7`), encoding 256 bits into `52 × 5 = 260` bits with the **4 trailing padding bits strictly zero** (so the 52nd character is always `a` or `q`).
+- Decoders MUST reject uppercase characters, `=`, wrong lengths, non-base32 characters, and non-zero trailing padding bits.
 
-To Git, a forge, Cargo and Nix these are ordinary names. A client running
-git signet reads the key out of the name and checks the signature on what it
-fetches, before any ref changes and before any file is written.
+### 1.2 Extracting signet IDs from names
+- **Remote URLs:** strip trailing `/`, `?query`, `#fragment`, take the last `/` or `:` path component, strip optional trailing `.git`, and scan for `.blincs-<52>` (or exact `blincs-<52>`).
+- **Ref names:** split by `/`, and in each segment scan at start-of-segment, after `.`, or after `+` for `blincs-<52>` delimited by end-of-segment, `.`, or `+`.
+- **Fail-closed rules:**
+  - If a segment contains `blincs-` followed by `>= 40` non-delimiter characters (or walk operators `~`, `^`, `@`, `:`) that fail strict decoding, reject as malformed (catching typos or truncation).
+  - If a ref name contains `^`, `~`, or `..` alongside a signet ID, reject as ambiguous.
+  - If two different signet IDs appear in the same ref name, or if a ref's signet ID disagrees with its remote URL's signet ID, reject as conflicting.
 
-## 2. The key in a name
+### 1.3 Digest-bound names (`+blake3-<64>`)
+- A ref name segment may contain `+blake3-<64-lowercase-hex>` (or `.blake3-<64-lowercase-hex>`), naming an exact 32-byte BLAKE3 commit digest.
+- `+blake3-<64>` and `+blincs-<52>` may appear in the same ref name in either order.
+- Conflicting `+blake3-` digests or malformed 40+-character `blake3-` tokens are rejected.
 
-A verifying key is written
+---
 
-    ed25519-<52-base32>
+## 2. BLINCS Imprint Armor (`BLINCSg1`)
 
-* `<52-base32>` is the 32-byte Ed25519 verifying key in unpadded lowercase
-  RFC 4648 base32 (alphabet `a`-`z`, `2`-`7`). 52 characters hold 260 bits;
-  the last 4 must be zero, so the 52nd character is `a` or `q`.
-* The whole thing is 60 characters from `[a-z0-9-]`.
+Imprints are stored in Git's standard `gpgsig` commit header (or appended to annotated tag payloads) using X.509/CMS-compatible PEM framing so stock Git (`gpg.format = x509`) handles insertion and `git verify-commit` / `git verify-tag` natively:
 
-`ed25519-` begins a key only at the start of a name or after `.` (in a ref
-name, also after `+`), and only when exactly 52 base32 characters follow and
-then the name ends or continues with `.` (or `+`). Anything else is an
-ordinary name: a repository called `ed25519-dalek`, a branch called
-`fix/ed25519-parsing`.
+```text
+-----BEGIN SIGNED MESSAGE-----
+<strict RFC 4648 base64, 64 chars per line>
+-----END SIGNED MESSAGE-----
+```
 
-Three things are errors, not ordinary names:
+The decoded binary payload is **exactly 5,656 bytes**:
 
-* 40 or more letters and digits in a key's place that are not a key (one
-  damaged in copying);
-* a key followed by `~`, `^`, `@` or `:`, or in a name containing `..`
-  (`main+ed25519-…~1` would otherwise look as if it pinned the parent);
-* two different keys in one name.
+| Offset | Length | Contents |
+|---|---|---|
+| `0` | `8` | ASCII magic `BLINCSg1` |
+| `8` | `32` | Signer `SignetId` bytes |
+| `40` | `5616` | Raw BLINCS `Imprint` bytes (`blincs::IMPRINT_LEN`) |
 
-Signatures are OpenSSH signatures in the namespace `git`, the ones
-`git commit -S` makes with `gpg.format = ssh`. To check one, a reader builds
-the 51-byte OpenSSH key
+Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 5,656 bytes or whose magic is not `BLINCSg1`.
 
-    00 00 00 0b "ssh-ed25519" 00 00 00 20 || <the 32 bytes>
+---
 
-and runs `ssh-keygen -Y verify -n git` with that as the only allowed signer.
+## 3. BLAKE3 Tree and History Binding (`signet-tree`, `signet-parent`)
 
-## 3. Where a key can be, and what it governs
+`git-signet` binds every commit to its tree and parents with **BLAKE3-256** (`derive_key` mode), using four distinct context strings:
 
-**In a repository's name.** The repository name is the last component of a
-remote's URL, after the last `/` or `:`, without a trailing `/` or `.git`.
-A key there is the key of that remote. It governs:
+| Object role | `blake3::derive_key` context string |
+|---|---|
+| File blob | `"git-signet 2026-11-24 file"` |
+| Tree directory | `"git-signet 2026-11-24 directory"` |
+| Commit carrying `signet-*` headers | `"git-signet 2026-11-24 commit"` |
+| Plain / stale commit | `"git-signet 2026-11-24 plain commit"` |
 
-* every remote-tracking ref of that remote, `refs/remotes/<remote>/*`;
-* the tags that arrive in the same clone or fetch as that remote's branches;
-* in a bare repository with exactly one remote (a mirror): its tags, its
-  branches and `HEAD`.
+### 3.1 File digest
+`D_file(blob)` is `BLAKE3_keyed(K_file, raw_blob_bytes)` (computed streaming; blobs `>= 64 KiB` use `blake3-servil`'s multi-core `Pipeline`).
 
-**In a branch or tag name.** A key in any `/`-separated part of a ref's name
-governs that ref: the remote-tracking ref of a branch so named, a tag so
-named, and in a bare repository a branch so named. It may sit beside
-git-buttress's `+blake3-<64-hex>`, in either order.
+### 3.2 Directory digest
+Given a Git tree object parsed into canonical entries `(mode, name, oid)`:
+- Concatenate for each entry in Git tree order:
+  - `mode` ASCII bytes (`100644`, `100755`, `120000`, `40000`, `160000`) || `0x20` || `name` raw bytes || `0x00`
+  - followed by:
+    - for gitlink (`160000`): the 20-byte raw submodule OID;
+    - for directory (`40000`): the 32-byte `D_dir(subtree)`;
+    - for file/symlink: the 32-byte `D_file(blob)`.
+- `D_dir(tree)` is `BLAKE3_keyed(K_dir, concatenated_entries)`.
+- Cycles and nesting deeper than 4,096 levels are rejected.
 
-**Never a local branch.** In a repository with a working tree, `refs/heads/*`
-and `HEAD` are the user's own work. `git commit`, `git merge`, `git rebase`
-and `git pull` are never refused, whoever's key the branch or the remote
-names.
+### 3.3 Commit headers
+A commit carrying BLAKE3 headers includes, directly after the `committer` header line:
+- Exactly one `signet-tree blake3 <40-hex-tree-oid> <64-hex-D_dir>` line whose `<40-hex-tree-oid>` equals the commit's `tree` header.
+- Exactly one `signet-parent blake3 <40-hex-parent-oid> <64-hex-D_commit>` line per `parent` header, in exact parent order, whose `<40-hex-parent-oid>` matches the corresponding `parent` header.
 
-If a ref is governed by a key in its name and a key in its remote's URL, the
-two must be the same key.
+### 3.4 Commit digest and classification
+- **Carrying commit:** has valid `signet-tree` matching `tree` and valid `signet-parent` lines matching every `parent`. Its commit digest is `D_commit(C) = BLAKE3_keyed(K_commit, raw_commit_bytes)`.
+- **Plain commit:** has zero `signet-tree` and zero `signet-parent` lines. Its commit digest is `D_commit(C) = BLAKE3_keyed(K_plain, D_dir(tree) || u32_le(parents.len()) || D_commit(p_0) || ... || raw_commit_bytes)`.
+- **Stale commit (`git commit --amend` artifact):** has exactly one `signet-tree` whose embedded tree OID differs from the commit's current `tree` OID (and zero malformed lines). Treated as plain during verification and replaced on `post-commit`.
+- **Malformed commit:** any duplicate `signet-tree`, mismatched `signet-parent` count/order, bad hex, or non-matching `signet-tree`/`signet-parent` digest is rejected.
 
-## 4. What a governed ref must point at
+Verification always uses a fresh **memory-only** digest map; unauthenticated disk cache files (`.git/signet-cache.bin`) are never relied on during verification or imprinting.
 
-* **A commit** carrying exactly one `gpgsig` header, an OpenSSH signature by
-  the key over the commit without that header.
-* **A tag** that carries such a signature itself (over the tag without its
-  signature block), or that names, through any chain of tags, a commit that
-  does. So lightweight tags, plain annotated tags and signed tags are all
-  accepted on a signed commit, and a signed tag is accepted on an unsigned one.
-* Anything else is refused: a tree, a blob, a GnuPG signature, a signature by
-  another key, no signature.
+---
 
-Only the object the ref points at is checked, not its ancestors.
+## 4. Salted Whole-Snapshot BLINCS Imprinting (Zero Pre-Hashing)
 
-A reader passes `--no-replace-objects` and `GIT_NO_LAZY_FETCH=1` to Git and
-runs the system's `ssh-keygen`, never a `gpg.ssh.program` named by the
-repository's own configuration.
+Rather than imprinting only the commit's ~300 bytes (which would rely on BLAKE3 collision resistance for tree contents), `git-signet` streams the **entire commit (or annotated tag + target commit) plus a canonical depth-first walk of its entire tree and every file byte** directly into `blincs::Signet::imprint_reader` and `blincs::SignetId::verify_reader`. Because BLINCS mixes a fresh per-imprint random salt into the streaming message hash, forging a second tree under the same imprint requires breaking salted second-preimage resistance rather than unsalted collision resistance.
 
-`git signet fsck` checks every remote-tracking ref, every tag (against the
-key of the repository's only remote, when it has exactly one), and in a bare
-repository every branch. `git signet check <rev>` checks one revision,
-including a local branch, against the key in its name, the key of the remote
-it tracks, or `--key`.
+### 4.1 Commit snapshot stream
+Framed as:
+```text
+"git-signet 2026-11-24 commit-snapshot\0"
+|| u64_le(commit_payload.len()) || commit_payload
+|| TreeWalk(commit.tree)
+```
+where `commit_payload` is the exact raw commit bytes with the `gpgsig` header removed.
 
-## 5. Signing
+### 4.2 Annotated tag snapshot stream
+If an annotated tag carries its own `BLINCSg1` imprint (e.g. `git tag -s`), its payload is peeled to its target commit `C` (rejecting tag cycles and depth `> 64`) and framed as:
+```text
+"git-signet 2026-11-24 tag-snapshot\0"
+|| u64_le(tag_payload.len()) || tag_payload
+|| u64_le(target_commit_raw.len()) || target_commit_raw
+|| TreeWalk(target_commit.tree)
+```
+where `tag_payload` is the raw tag bytes preceding `-----BEGIN SIGNED MESSAGE-----`.
 
-The signatures are stock Git's, so stock Git makes them. `git signet adopt
-<signing-key>` (or `keygen`, which makes a key first) writes, once per
-machine:
+### 4.3 Canonical `TreeWalk(tree_oid)` stream
+Iterative depth-first traversal (explicit stack, max depth 4,096, cycle rejection):
+- On entering a tree: `b'D' || u32_le(entries.len())`
+- For each entry in Git tree order:
+  - `u32_le(mode.len()) || mode || u32_le(name.len()) || name`
+  - If gitlink (`160000`): `b'G' || oid_20_bytes`
+  - If subtree (`40000`): recurse `TreeWalk(entry.oid)`
+  - If file/symlink: `b'F' || u64_le(blob_len) || <raw blob bytes streamed directly from git cat-file --batch>`
+- On leaving a tree: `b'E'`
 
-* `~/.config/git-signet/sign/<key>.gitconfig`, holding `gpg.format = ssh`,
-  `user.signingkey = <signing-key>` and `commit.gpgsign = true`;
-* four `includeIf` entries in the global Git configuration that include that
-  file when the current branch's name, or any remote's URL, contains the key.
+---
 
-From then on plain `git commit` in such a repository or on such a branch is
-signed as Git creates it; so are the commits made by `git merge`,
-`git rebase`, `git cherry-pick`, `git revert` and `git am`. Nothing happens
-anywhere else, and nothing happens for someone who does not hold the key.
+## 5. Governing Signet Rules and Formal Transitive-Closure Rule
 
-The branch-name condition is off while `HEAD` is detached, which is where a
-rebase stops for a conflict. So the first time a branch whose name carries an
-adopted key is created or moved, git signet records
-`include.path = <that file>` in the repository's own configuration, and says
-so. From then on every commit in that repository is signed.
+### 5.1 Governing signet ID
+For a ref update `R -> O`:
+1. In a non-bare repository, local `refs/heads/*` and `HEAD` are **never** governed by a signet (so local commits are never refused).
+2. A `blincs-<52>` in `R` governs `R` (for remote-tracking refs, tags, and bare-repo branches).
+3. A `blincs-<52>` in `remote.<name>.url` governs `refs/remotes/<name>/*`, tags arriving in the same fetch (or in a single-remote repo), and in a bare single-remote mirror its branches, tags, and `HEAD`.
+4. Conflicting signet IDs between `R` and the remote URL are rejected.
 
-Tags are not signed automatically. Git's setting for that, `tag.gpgSign`,
-makes plain `git tag <name>` demand a message. Section 4 accepts a tag on a
-signed commit as it is.
+### 5.2 Formal authorization rule
+A ref update `R -> O` governed by signet ID `S` is **accepted** if and only if:
+1. Its BLAKE3 commit chain verifies cleanly (stopping at `.git/shallow` grafts only when shallow mode is permitted, and always verifying the tip's `signet-tree`), **and**
+2. One of the following holds:
+   - **(a) Direct commit imprint:** `O` is a commit (or tag peeling to a commit `C`) carrying a `BLINCSg1` imprint that verifies `CommitSnapshot(C)` under `S`; or
+   - **(b) Direct annotated-tag imprint:** `O` is an annotated tag carrying a `BLINCSg1` imprint that verifies `TagSnapshot(O)` under `S`; or
+   - **(c) Transitive ancestor closure:** `O` is a commit (or tag peeling to a commit `C`) that lies in the **BLAKE3-verified transitive ancestor closure** of a commit `T` whose direct imprint under `S` has been verified (either in the same transaction batch or on an existing governed ref of the repository).
 
-## 6. With git-buttress
+Rule (c) lets repositories adopt `git-signet` without rewriting historical commits or old release tags: once a newer tip commit `T` carries `signet-parent` bindings reaching back to `C` and a valid BLINCS imprint under `S`, old tags pointing to `C` verify automatically, while any commit outside `T`'s verified ancestor closure is refused.
 
-[git-buttress](https://github.com/jasonhadler25/git-buttress) adds BLAKE3
-digests of the files and history to each commit before it is signed. The two
-check different things and are installed side by side, each as a Git 2.56
-configured hook, neither touching `core.hooksPath`:
+---
 
-* git signet: was this signed by the key in the name? A SHA-1 collision
-  defeats it alone, because the signature covers only SHA-1 identifiers.
-* git-buttress: do the files and history match the BLAKE3 digests in the
-  commit? Someone who can push defeats it alone, by writing new digests.
-* Together, the signature covers the digests.
+## 6. Seed File Storage
 
-## 7. What it does not do
-
-* **It does not tie a commit to a ref's name.** The signature covers the
-  commit, not which branch or tag it belongs under. A server can answer with
-  an older signed commit (rollback), or serve one branch's signed commit as
-  another branch or as a tag. A digest pinned from elsewhere (git-buttress's
-  `--expect` or `+blake3-`) closes this for one revision.
-* **In a repository whose name carries a key, every branch must be signed by
-  it.** A branch pushed by a bot, or a commit made by a forge's merge button,
-  makes clone and fetch fail for everyone running git signet until it is
-  gone. A key in a branch's name constrains only that branch.
-* **Tags that arrive alone are not checked on arrival.** A fetch that brings
-  new tags and moves no branch gives the hook no way to tell them from tags
-  made locally. `git signet fsck` checks them.
-* **Refs fetched outside a remote's namespace are not checked**:
-  `git pull <url>`, `git fetch <remote> <branch>:<local-branch>`.
-* **Clients that do not run Git's hooks are not stopped**: `jj git fetch`,
-  `gix clone`, Cargo's fetcher, a forge's tarball. Run `git signet fsck`.
-* **No key rotation.** The key is the name. A new key is a new name.
-* **Not post-quantum.** Ed25519.
+Seed files generated by `git signet keygen` are stored with mode `0600` at `~/.config/git-signet/signets/<blincs-52>.seed` as **exactly 40 bytes**:
+- `b"BLINCSs1"` (8-byte magic) || 32-byte OS randomness seed (read from character device `/dev/urandom`).
