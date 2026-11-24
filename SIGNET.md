@@ -78,8 +78,8 @@ Given a Git tree object parsed into canonical entries `(mode, name, oid)`:
 
 ### 3.3 Commit headers
 A commit carrying BLAKE3 headers includes, directly after the `committer` header line:
-- Exactly one `signet-tree blake3 <40-hex-tree-oid> <64-hex-D_dir>` line whose `<40-hex-tree-oid>` equals the commit's `tree` header.
-- Exactly one `signet-parent blake3 <40-hex-parent-oid> <64-hex-D_commit>` line per `parent` header, in exact parent order, whose `<40-hex-parent-oid>` matches the corresponding `parent` header.
+- Exactly one `signet-tree blake3 <40-hex-tree-oid> <64-hex-D_dir>` line whose `<40-hex-tree-oid>` equals the commit's `tree` header (carrying the tree OID lets `parse_commit` distinguish a stale `git commit --amend` header from a malformed commit).
+- Exactly one `signet-parent blake3 <64-hex-D_commit>` line per `parent` header, in exact parent order.
 
 ### 3.4 Commit digest and classification
 - **Carrying commit:** has valid `signet-tree` matching `tree` and valid `signet-parent` lines matching every `parent`. Its commit digest is `D_commit(C) = BLAKE3_keyed(K_commit, raw_commit_bytes)`.
