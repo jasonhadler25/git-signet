@@ -519,14 +519,20 @@ pub fn peel_to_commit(repo: &mut GitRepo, start: &Oid) -> Result<Oid, ChainError
 ///
 /// Uses a fresh memory-only cache so unauthenticated disk files are never relied on.
 /// Returns all verified ancestor commit OIDs (including `tip`) for the transitive-closure rule.
-/// If `allow_shallow` is true and `.git/shallow` lists a graft commit, verification stops cleanly
-/// after verifying that graft commit's own `signet-tree` (without fabricating missing parents).
+/// - If `allow_shallow` is true and `.git/shallow` lists a graft commit, verification stops cleanly
+///   after verifying that graft commit's own `signet-tree` (without fabricating missing parents).
+/// - If `stop_at` is `Some(oid)` (an already-verified previous ref value during incremental `fetch`)
+///   and `expected_digest.is_none()`, traversal stops once `oid` is reached without re-walking older
+///   history.
+/// - Plain commits with no carrying descendant and no `expected_digest` do not hash their trees,
+///   so cloning or fetching ordinary repositories stays fast with zero noticeable slowdown.
 pub fn verify_commit_chain(
     repo: &mut GitRepo,
     ctx: &ContextKeys,
     tip: &Oid,
     expected_digest: Option<&Dig>,
     allow_shallow: bool,
+    stop_at: Option<&Oid>,
 ) -> Result<VerifyReport, ChainError> {
     let grafts = if allow_shallow { load_shallow_grafts(repo) } else { HashSet::new() };
     let mut cache = DigestCache::memory_only();
@@ -539,6 +545,9 @@ pub fn verify_commit_chain(
 
     while let Some(oid) = queue.pop_front() {
         if !visited.insert(oid) {
+            continue;
+        }
+        if stop_at == Some(&oid) && oid != *tip && expected_digest.is_none() {
             continue;
         }
         let (kind, raw) = repo.read_object(&oid).map_err(ChainError::store)?;
@@ -576,7 +585,7 @@ pub fn verify_commit_chain(
                                 to_hex(&actual_p)
                             )));
                         }
-                        if !visited.contains(p_oid) {
+                        if !visited.contains(p_oid) && stop_at != Some(p_oid) {
                             queue.push_back(*p_oid);
                         }
                     }
@@ -585,10 +594,9 @@ pub fn verify_commit_chain(
             }
             CommitClass::Plain | CommitClass::Stale => {
                 plain_commits += 1;
-                let _ = compute_tree_digest(repo, ctx, &parsed.tree, &mut cache)?;
                 if !is_graft {
                     for p_oid in &parsed.parents {
-                        if !visited.contains(p_oid) {
+                        if !visited.contains(p_oid) && stop_at != Some(p_oid) {
                             queue.push_back(*p_oid);
                         }
                     }
@@ -597,7 +605,13 @@ pub fn verify_commit_chain(
         }
     }
 
-    let tip_digest = if let Some(d) = cache.get_commit(tip) { d } else { compute_commit_digest(repo, ctx, tip, &mut cache)? };
+    let tip_digest = if let Some(d) = cache.get_commit(tip) {
+        d
+    } else if expected_digest.is_some() || carrying_commits > 0 {
+        compute_commit_digest(repo, ctx, tip, &mut cache)?
+    } else {
+        [0u8; 32]
+    };
     if let Some(exp) = expected_digest
         && tip_digest != *exp
     {

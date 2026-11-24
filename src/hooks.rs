@@ -313,7 +313,14 @@ pub fn enable_signet(global: bool, wrapper_dir: Option<&Path>) -> Result<(), Str
         git_config_set(global, &format!("hook.{name}.event"), event)?;
         git_config_set(global, &format!("hook.{name}.command"), &cmd_val)?;
     }
-    git_config_set(global, "gpg.x509.program", &exe)?;
+    let existing_x509 = global_git_cmd()
+        .ok()
+        .and_then(|mut c| c.args(["config", if global { "--global" } else { "--local" }, "--get", "gpg.x509.program"]).output().ok())
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    if existing_x509.as_deref().is_none_or(|p| p.contains("git-signet")) {
+        git_config_set(global, "gpg.x509.program", &exe)?;
+    }
     if let Some(dir) = wrapper_dir {
         install_git_wrapper(dir, &exe)?;
     }
@@ -325,7 +332,14 @@ pub fn disable_signet(global: bool, wrapper_dir: Option<&Path>) -> Result<(), St
         git_config_unset_all(global, &format!("hook.{name}.event"))?;
         git_config_unset_all(global, &format!("hook.{name}.command"))?;
     }
-    git_config_unset_all(global, "gpg.x509.program")?;
+    let existing_x509 = global_git_cmd()
+        .ok()
+        .and_then(|mut c| c.args(["config", if global { "--global" } else { "--local" }, "--get", "gpg.x509.program"]).output().ok())
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    if existing_x509.as_deref().is_some_and(|p| p.contains("git-signet")) {
+        git_config_unset_all(global, "gpg.x509.program")?;
+    }
     if let Some(dir) = wrapper_dir {
         let p = dir.join("git");
         if is_wrapper_script(&p) {
@@ -700,11 +714,11 @@ fn verify_direct_imprint(repo: &mut GitRepo, oid: &Oid, expected_id: &SignetId) 
     }
 }
 
-/// Verify a batch of `(refname, new_oid)` updates under BOTH:
+/// Verify a batch of `(refname, old_oid, new_oid)` updates under BOTH:
 /// 1. BLAKE3 tree + history verification (`signet-tree` / `signet-parent` + `+blake3-<64>` pins), AND
 /// 2. Formal signet transitive-closure authorization (direct salted whole-snapshot BLINCS imprint OR
 ///    membership in the BLAKE3-verified ancestor closure of a directly verified imprinted commit under `S`).
-pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid)], strict_tags_only_check: bool) -> Result<(), String> {
+pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], strict_tags_only_check: bool) -> Result<(), String> {
     if updates.is_empty() {
         return Ok(());
     }
@@ -712,7 +726,7 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid)], strict_ta
 
     // Detect if any remote-tracking ref in this batch carries a remote signet ID (for tags arriving in the same fetch).
     let mut batch_remote_ids: HashSet<[u8; 32]> = HashSet::new();
-    for (refname, _) in updates {
+    for (refname, _, _) in updates {
         if let Some(rest) = refname.strip_prefix("refs/remotes/")
             && let Some((rname, _)) = rest.split_once('/')
             && let Some(url) = repo.config_get(&format!("remote.{rname}.url"))
@@ -728,7 +742,7 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid)], strict_ta
     let mut pending_ancestor_checks: Vec<(String, Oid, Oid, SignetId)> = Vec::new();
     let missing_policy = repo.config_get("signet.missing").unwrap_or_else(|| "ignore".into());
 
-    for (refname, oid) in updates {
+    for (refname, old_oid, oid) in updates {
         if *oid == ZERO_OID {
             continue; // Deletion
         }
@@ -754,11 +768,17 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid)], strict_ta
             }
         };
 
+        let stop_at = if !strict_tags_only_check && *old_oid != ZERO_OID && b3_pin.is_none() { Some(old_oid) } else { None };
+
         // Always verify BLAKE3 chain (memory-only cache) on governed, pinned, or carrying commits.
-        let report = match verify_commit_chain(repo, &ctx, &commit_oid, b3_pin.as_ref(), true) {
+        let report = match verify_commit_chain(repo, &ctx, &commit_oid, b3_pin.as_ref(), true, stop_at) {
             Ok(r) => r,
             Err(ChainError { kind: ChainErrorKind::Incomplete, message }) if gov_id.is_none() && b3_pin.is_none() => {
-                eprintln!("git-signet: warning: incomplete history on {}: {message}", sanitize_for_tty(refname));
+                if missing_policy == "warn" {
+                    eprintln!("git-signet: warning: incomplete history on {}: {message}", sanitize_for_tty(refname));
+                } else if missing_policy == "error" {
+                    return Err(format!("incomplete history on {}: {message}", sanitize_for_tty(refname)));
+                }
                 continue;
             }
             Err(e) => {
@@ -797,7 +817,7 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid)], strict_ta
             if let Ok(Some(esid)) = governing_signet(repo, &eref, None)
                 && needed_ids.contains(esid.as_bytes())
                 && let Ok(Some(verified_commit)) = verify_direct_imprint(repo, &eoid, &esid)
-                && let Ok(rep) = verify_commit_chain(repo, &ctx, &verified_commit, None, true)
+                && let Ok(rep) = verify_commit_chain(repo, &ctx, &verified_commit, None, true, None)
             {
                 authorized_ancestors.entry(*esid.as_bytes()).or_default().extend(rep.ancestors.iter().copied());
             }
@@ -830,15 +850,16 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut updates: Vec<(String, Oid)> = Vec::new();
+    let mut updates: Vec<(String, Oid, Oid)> = Vec::new();
     for line in stdin_txt.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() != 3 || parts[1].starts_with("ref:") {
             continue;
         }
+        let old_oid = if parts[0].starts_with("ref:") { ZERO_OID } else { decode_lower_hex::<20>(parts[0]).unwrap_or(ZERO_OID) };
         let new_oid = decode_lower_hex::<20>(parts[1]).map_err(|e| format!("bad new oid in reference-transaction: {e}"))?;
         let refname = parts[2].to_owned();
-        updates.push((refname, new_oid));
+        updates.push((refname, old_oid, new_oid));
     }
     if updates.is_empty() {
         return Ok(());
@@ -849,7 +870,7 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
     // If a local branch whose name carries an adopted signet ID is created/updated, wire local `include.path`
     // so detached-HEAD rebases continue imprinting automatically!
     if !repo.is_bare {
-        for (refname, oid) in &updates {
+        for (refname, _, oid) in &updates {
             if *oid != ZERO_OID
                 && let Some(branch) = refname.strip_prefix("refs/heads/")
                 && let Ok(Some(sid)) = extract_signet_from_refname(branch)
@@ -900,12 +921,18 @@ pub fn check_revision(
 
     let ctx = ContextKeys::new();
     let commit_oid = peel_to_commit(repo, &oid).map_err(|e| e.message)?;
-    let report = verify_commit_chain(repo, &ctx, &commit_oid, want_dig.as_ref(), !no_shallow).map_err(|e| e.message)?;
+    let report = verify_commit_chain(repo, &ctx, &commit_oid, want_dig.as_ref(), !no_shallow, None).map_err(|e| e.message)?;
+    let shown_digest = if report.carrying_commits == 0 && want_dig.is_none() {
+        let mut cache = DigestCache::memory_only();
+        compute_commit_digest(repo, &ctx, &commit_oid, &mut cache).map_err(|e| e.message)?
+    } else {
+        report.digest
+    };
 
     let mut summary = format!(
         "MATCH {}\n  blake3:  {}\n  commits: {} carrying lines, {} plain{}",
         to_hex(&commit_oid),
-        to_hex(&report.digest),
+        to_hex(&shown_digest),
         report.carrying_commits,
         report.plain_commits,
         if report.shallow_boundary_hit { " (shallow boundary reached)" } else { "" }
@@ -922,7 +949,7 @@ pub fn check_revision(
                 if let Ok(Some(esid)) = governing_signet(repo, &eref, None)
                     && esid == sid
                     && let Ok(Some(vcommit)) = verify_direct_imprint(repo, &eoid, &sid)
-                    && let Ok(rep) = verify_commit_chain(repo, &ctx, &vcommit, None, !no_shallow)
+                    && let Ok(rep) = verify_commit_chain(repo, &ctx, &vcommit, None, !no_shallow, None)
                     && rep.ancestors.contains(&commit_oid)
                 {
                     in_closure = true;
@@ -945,7 +972,7 @@ pub fn check_revision(
 
 /// Verify every remote-tracking ref, tag, and branch in `repo` (BLAKE3 chains + BLINCS signet authorization).
 pub fn fsck_repo(repo: &mut GitRepo, verbose: bool) -> Result<usize, String> {
-    let refs = repo.for_each_ref(None)?;
+    let refs: Vec<(String, Oid, Oid)> = repo.for_each_ref(None)?.into_iter().map(|(r, o)| (r, ZERO_OID, o)).collect();
     verify_ref_batch(repo, &refs, true)?;
     if verbose {
         println!("git-signet fsck: {} ref(s) verified cleanly.", refs.len());

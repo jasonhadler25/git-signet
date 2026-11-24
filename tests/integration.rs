@@ -354,6 +354,49 @@ fn merge_commit_empty_tree_no_gpg_sign_and_shallow_clone() {
 }
 
 #[test]
+fn plain_repo_zero_warnings_and_preserves_custom_x509_program() {
+    let env = TestEnv::new("plain-silent");
+    // Pre-configure a custom gpg.x509.program (e.g. corporate gpgsm) and verify `enable` does NOT clobber it!
+    env.git_ok(&env.root, &["config", "--global", "gpg.x509.program", "/usr/local/bin/custom-gpgsm"]);
+    env.signet_ok(&env.root, &["enable", "--global"]);
+    let x509 = env.git_ok(&env.root, &["config", "--global", "--get", "gpg.x509.program"]);
+    assert_eq!(x509.trim(), "/usr/local/bin/custom-gpgsm", "enable unexpectedly overwrote existing custom gpg.x509.program!");
+
+    // Create a plain bare repo (ZERO signet headers, ZERO signet IDs) with multiple commits.
+    let plain_remote = env.root.join("plain-upstream.git");
+    fs::create_dir_all(&plain_remote).unwrap();
+    env.git_ok(&plain_remote, &["init", "--bare"]);
+    let upstream = env.root.join("upstream-work");
+    env.git_ok(&env.root, &["clone", plain_remote.to_str().unwrap(), upstream.to_str().unwrap()]);
+    for i in 1..=3 {
+        fs::write(upstream.join(format!("f{i}.txt")), format!("plain content {i}\n")).unwrap();
+        env.git_ok(&upstream, &["add", "."]);
+        // Simulate a collaborator who does NOT run git-signet.
+        let c = env.git_with_env(&upstream, &["commit", "-m", &format!("plain {i}")], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+        assert!(c.status.success());
+    }
+    let p = env.git_with_env(&upstream, &["push", "origin", "main"], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+    assert!(p.status.success());
+
+    // Cloning and shallow-cloning a plain repo with git-signet enabled must succeed with ZERO git-signet warnings!
+    let client = env.root.join("client-plain");
+    let clone_out = env.git(&env.root, &["clone", plain_remote.to_str().unwrap(), client.to_str().unwrap()]);
+    assert!(clone_out.status.success());
+    let stderr = String::from_utf8_lossy(&clone_out.stderr);
+    assert!(!stderr.contains("git-signet:") && !stderr.to_ascii_lowercase().contains("warning"), "unexpected git-signet output on plain repo clone: {stderr}");
+
+    let shallow_plain = env.root.join("client-plain-shallow");
+    let file_url = format!("file://{}", plain_remote.display());
+    let sh_out = env.git(&env.root, &["clone", "--depth=1", &file_url, shallow_plain.to_str().unwrap()]);
+    assert!(sh_out.status.success());
+    let sh_err = String::from_utf8_lossy(&sh_out.stderr);
+    assert!(
+        !sh_err.contains("git-signet:") && !sh_err.to_ascii_lowercase().contains("warning"),
+        "unexpected git-signet output on plain shallow clone: {sh_err}"
+    );
+}
+
+#[test]
 fn formal_transitive_closure_old_tags_and_rogue_tag_rejection() {
     let env = TestEnv::new("closure");
     // Create pre-adoption repo with old unsigned commit A tagged `v0.1` (hooks not yet enabled).
@@ -456,7 +499,7 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     let bad_payload = insert_signet_headers(&raw_commit, &parsed.tree, &bad_tree_dig, &[]).unwrap();
     let bad_oid = repo.hash_object_write(ObjKind::Commit, &bad_payload).unwrap();
     let ctx = ContextKeys::new();
-    assert!(verify_commit_chain(&mut repo, &ctx, &bad_oid, None, false).is_err(), "accepted forged signet-tree digest!");
+    assert!(verify_commit_chain(&mut repo, &ctx, &bad_oid, None, false, None).is_err(), "accepted forged signet-tree digest!");
 
     // Tamper tree content under the same commit payload (new blob -> new tree -> swap tree OID into payload)
     // while keeping original armor -> BLINCS snapshot verifier rejects!
