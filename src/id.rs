@@ -9,8 +9,8 @@ pub const BLAKE3_PREFIX: &str = "blake3-";
 pub const BLAKE3_HEX_LEN: usize = 64;
 
 pub const ARMOR_MAGIC: &[u8; 8] = b"BLINCSg2";
-pub const ARMOR_RAW_LEN: usize = ARMOR_MAGIC.len() + SIGNET_ID_LEN + IMPRINT_LEN; // 7,432 bytes
-const _: () = assert!(ARMOR_RAW_LEN == 7432);
+pub const ARMOR_RAW_LEN: usize = ARMOR_MAGIC.len() + SIGNET_ID_LEN + IMPRINT_LEN; // 6,472 bytes
+const _: () = assert!(ARMOR_RAW_LEN == 6472);
 pub const X509_BEGIN: &[u8] = b"-----BEGIN SIGNED MESSAGE-----";
 pub const X509_END: &[u8] = b"-----END SIGNED MESSAGE-----";
 

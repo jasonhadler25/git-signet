@@ -39,15 +39,15 @@ Imprints are stored in Git's standard `gpgsig` commit header (or appended to ann
 -----END SIGNED MESSAGE-----
 ```
 
-The decoded binary payload is **exactly 7,432 bytes**:
+The decoded binary payload is **exactly 6,472 bytes**:
 
 | Offset | Length | Contents |
 |---|---|---|
 | `0` | `8` | ASCII magic `BLINCSg2` |
 | `8` | `32` | `SignetId` bytes |
-| `40` | `7392` | Raw `BLINCS-128-7x5` `Imprint` bytes (`signet::IMPRINT_LEN`) |
+| `40` | `6432` | Raw `BLINCS-128-7x5` `Imprint` bytes (`signet::IMPRINT_LEN`) |
 
-Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 7,432 bytes or whose magic is not `BLINCSg2`.
+Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 6,472 bytes or whose magic is not `BLINCSg2`.
 
 ---
 
