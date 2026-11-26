@@ -1,2 +1,4 @@
 /target
 *.private.txt
+__pycache__/
+*.pyc

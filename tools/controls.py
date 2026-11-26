@@ -3,7 +3,7 @@
 
 Copies the repository to a temporary directory, injects one security defect at a time
 into `src/`, runs `cargo nextest run --locked`, and requires every planted defect to
-cause a test failure. Never mutates the working tree.
+compile cleanly and cause a test failure (exit code 100, never compile error 101).
 """
 
 import os
@@ -18,8 +18,8 @@ CONTROLS = [
     (
         "skip_direct_imprint_check",
         "src/hooks.rs",
-        'Err(msg) if msg.contains("missing gpgsig header") => Ok(None),',
-        'Err(msg) if msg.contains("missing gpgsig header") => Ok(Some(*oid)),',
+        "ExtractedArmor::Absent => Ok(None),",
+        "ExtractedArmor::Absent => Ok(Some(DirectAuth::Commit(*oid))),",
     ),
     (
         "skip_signet_tree_compare",
@@ -55,19 +55,49 @@ CONTROLS = [
         "allow_conflicting_signets",
         "src/id.rs",
         'return Err(format!("conflicting blincs signet IDs in refname {refname:?}"));',
-        'let _ = (prev, id);',
+        "let _ = (prev, id);",
     ),
     (
         "disable_no_shallow_enforcement",
         "src/blake3_chain.rs",
-        "let grafts = if allow_shallow { load_shallow_grafts(repo) } else { HashSet::new() };",
-        "let grafts = if true || allow_shallow { load_shallow_grafts(repo) } else { HashSet::new() };",
+        "let grafts: HashSet<Oid> = if allow_shallow { repo.shallow.clone() } else { HashSet::new() };",
+        "let grafts: HashSet<Oid> = if true || allow_shallow { repo.shallow.clone() } else { HashSet::new() };",
     ),
     (
         "drop_snapshot_context",
         "src/snapshot.rs",
-        "match embedded_id.verify_reader(ctx, reader, &imprint) {",
-        "match embedded_id.verify_reader(Context::EMPTY, reader, &imprint) {",
+        "match embedded_id.verify_reader(ctx, &mut reader, &imprint) {",
+        "match embedded_id.verify_reader(Context::EMPTY, &mut reader, &imprint) {",
+    ),
+    (
+        "c1_skip_verify_before_reimprint",
+        "src/hooks.rs",
+        'verify_payload_imprint(repo, ObjKind::Commit, &orig_payload, &armor, Some(&embedded_id))\n                    .map_err(|e| format!("refusing to re-imprint commit with unverified BLINCS imprint: {e}"))?;',
+        "let _ = &orig_payload;",
+    ),
+    (
+        "c2_ignore_malformed_ref_tx_line",
+        "src/hooks.rs",
+        'return Err("malformed reference-transaction record: missing second ASCII space".into());',
+        "continue;",
+    ),
+    (
+        "h1_tag_imprint_delegates_closure",
+        "src/hooks.rs",
+        "                Some(DirectAuth::Tag(_)) => {\n                    // Directly imprinted annotated tag authorizes THIS tag itself (SIGNET.md §5.2(b)),",
+        "                Some(DirectAuth::Tag(_)) => {\n                    authorized_ancestors.entry(*sid.as_bytes()).or_default().insert(commit_oid);\n                    if let Ok((_, raw_c)) = repo.read_object(&commit_oid) && let Ok(p) = parse_commit(raw_c) { authorized_ancestors.entry(*sid.as_bytes()).or_default().extend(p.parents); }\n                    // Directly imprinted annotated tag authorizes THIS tag itself (SIGNET.md §5.2(b)),",
+    ),
+    (
+        "h5_allow_conflicting_expect_pin",
+        "src/hooks.rs",
+        '(Some(a), Some(b)) if a != b => {\n            return Err(format!("conflicting BLAKE3 expectations: refname pins {}, --expect requests {}", to_hex(&a), to_hex(&b)));\n        }',
+        "(Some(_), Some(b)) => Some(b),",
+    ),
+    (
+        "h5_skip_expected_signet_id_match",
+        "src/snapshot.rs",
+        "if let Some(exp) = expected_id\n        && embedded_id != *exp\n    {",
+        "if false && let Some(exp) = expected_id && embedded_id != *exp {",
     ),
 ]
 
@@ -81,12 +111,10 @@ def main():
             work,
             ignore=shutil.ignore_patterns(".git", "target"),
         )
-        # Share target directory with ROOT's target so incremental builds take ~1s per control.
         target_dir = os.path.join(tmp, "target")
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = target_dir
 
-        # Baseline must pass cleanly first.
         base = subprocess.run(
             ["cargo", "nextest", "run", "--locked", "--no-fail-fast"],
             cwd=work,
@@ -124,6 +152,12 @@ def main():
 
             if res.returncode == 0:
                 print(f"FAIL: planted fault {name} was NOT caught!", file=sys.stderr)
+                return 1
+            if res.returncode != 100 or "failed" not in (res.stdout + res.stderr):
+                print(
+                    f"FAIL: planted fault {name} exited {res.returncode} (expected 100 test failure, not build error):\n{res.stdout}\n{res.stderr}",
+                    file=sys.stderr,
+                )
                 return 1
             caught += 1
             print(f"  CAUGHT ({caught}/{len(CONTROLS)}): {name}")

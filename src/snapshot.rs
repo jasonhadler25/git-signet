@@ -3,7 +3,7 @@
 //! Streams a uniquely decodable canonical serialization of a Git commit (or annotated tag targeting
 //! a commit) PLUS the entire depth-first directory/file tree directly into `signet::Signet::imprint_reader`
 //! / `signet::SignetId::verify_reader` under a bounded length-framed BLINCS [`Context`], pulling blobs
-//! directly from `git cat-file --batch` with constant memory so multi-gigabyte repositories never buffer in RAM.
+//! directly from `git cat-file --batch` with constant memory and bounded expansion work.
 //!
 //! Wire framing (injective / uniquely decodable, domain-separated via BLINCS `Context`):
 //!
@@ -34,6 +34,9 @@ use std::io::{self, ErrorKind, Read};
 pub const COMMIT_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 commit-snapshot");
 pub const TAG_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 tag-snapshot");
 const MAX_TREE_DEPTH: usize = 4_096;
+const MAX_SNAPSHOT_ENTRIES: usize = 1_000_000;
+const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const _: () = assert!(MAX_SNAPSHOT_BYTES == 17_179_869_184);
 
 struct TreeFrame {
     oid: Oid,
@@ -50,6 +53,8 @@ pub struct SnapshotReader<'a> {
     active_dirs: HashSet<Oid>,
     blob_remaining: u64,
     need_blob_nl: bool,
+    entries_seen: usize,
+    bytes_emitted: u64,
     finished: bool,
 }
 
@@ -96,8 +101,27 @@ impl<'a> SnapshotReader<'a> {
             active_dirs,
             blob_remaining: 0,
             need_blob_nl: false,
+            entries_seen: 0,
+            bytes_emitted: 0,
             finished: false,
         })
+    }
+
+    /// Ensure the underlying `cat-file --batch` stream is clean if this reader did not finish cleanly.
+    pub fn finish_or_reset(self) {
+        if self.blob_remaining > 0 || self.need_blob_nl {
+            self.repo.reset_batch();
+        }
+    }
+
+    fn account_bytes(&mut self, n: usize) -> io::Result<()> {
+        let add = u64::try_from(n).map_err(|_| io::Error::new(ErrorKind::InvalidData, "snapshot length overflow"))?;
+        self.bytes_emitted = self.bytes_emitted.checked_add(add).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "snapshot length overflow"))?;
+        if self.bytes_emitted > MAX_SNAPSHOT_BYTES {
+            self.repo.reset_batch();
+            return Err(io::Error::new(ErrorKind::InvalidData, "snapshot exceeds 16 GiB expansion limit"));
+        }
+        Ok(())
     }
 
     /// Refill `self.buf` or open the next blob stream. Returns `Ok(true)` if bytes are ready, `Ok(false)` at EOF.
@@ -121,6 +145,11 @@ impl<'a> SnapshotReader<'a> {
 
         if let Some(top) = self.stack.last_mut() {
             if top.next_idx < top.entries.len() {
+                self.entries_seen += 1;
+                if self.entries_seen > MAX_SNAPSHOT_ENTRIES {
+                    self.repo.reset_batch();
+                    return Err(io::Error::new(ErrorKind::InvalidData, "snapshot exceeds maximum expanded entry limit"));
+                }
                 let entry = top.entries[top.next_idx].clone();
                 top.next_idx += 1;
                 if entry.is_dir {
@@ -186,6 +215,7 @@ impl Read for SnapshotReader<'_> {
                 let n = (self.buf.len() - self.pos).min(out.len());
                 out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
                 self.pos += n;
+                self.account_bytes(n)?;
                 return Ok(n);
             }
             if self.blob_remaining > 0 {
@@ -203,6 +233,7 @@ impl Read for SnapshotReader<'_> {
                     }
                 };
                 self.blob_remaining -= u64::try_from(n).unwrap();
+                self.account_bytes(n)?;
                 return Ok(n);
             }
             if self.finished {
@@ -215,9 +246,17 @@ impl Read for SnapshotReader<'_> {
     }
 }
 
+/// Typed extraction result separating absent armor from malformed/duplicate signature blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtractedArmor {
+    Present { payload: Vec<u8>, armor: Vec<u8> },
+    Absent,
+    Malformed(String),
+}
+
 /// Split a raw Git commit object into `(commit_payload_without_gpgsig, armor_bytes)`.
-/// Rejects duplicate `gpgsig` headers.
-pub fn extract_commit_imprint(raw_commit: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// Distinguishes missing `gpgsig` from duplicate/malformed `gpgsig` headers.
+pub fn extract_commit_imprint(raw_commit: &[u8]) -> ExtractedArmor {
     let (headers_end, has_sep) = match raw_commit.windows(2).position(|w| w == b"\n\n") {
         Some(pos) => (pos, true),
         None => (raw_commit.len(), false),
@@ -233,7 +272,7 @@ pub fn extract_commit_imprint(raw_commit: &[u8]) -> Result<(Vec<u8>, Vec<u8>), S
         let line = lines[i];
         if let Some(first) = line.strip_prefix(b"gpgsig ") {
             if sig_lines.is_some() {
-                return Err("commit carries duplicate gpgsig headers".into());
+                return ExtractedArmor::Malformed("commit carries duplicate gpgsig headers".into());
             }
             let mut block = vec![first];
             i += 1;
@@ -248,7 +287,9 @@ pub fn extract_commit_imprint(raw_commit: &[u8]) -> Result<(Vec<u8>, Vec<u8>), S
         i += 1;
     }
 
-    let block = sig_lines.ok_or_else(|| "commit carries no imprint (missing gpgsig header)".to_string())?;
+    let Some(block) = sig_lines else {
+        return ExtractedArmor::Absent;
+    };
     let mut armor = Vec::new();
     for l in &block {
         armor.extend_from_slice(l);
@@ -266,13 +307,14 @@ pub fn extract_commit_imprint(raw_commit: &[u8]) -> Result<(Vec<u8>, Vec<u8>), S
         payload.extend_from_slice(b"\n\n");
         payload.extend_from_slice(body_bytes);
     }
-    Ok((payload, armor))
+    ExtractedArmor::Present { payload, armor }
 }
 
 /// Split a raw Git annotated tag object into `(tag_payload_without_armor, armor_bytes)`.
-pub fn extract_tag_imprint(raw_tag: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// Distinguishes absent armor from duplicate/malformed imprint blocks.
+pub fn extract_tag_imprint(raw_tag: &[u8]) -> ExtractedArmor {
     let Some(sep) = raw_tag.windows(2).position(|w| w == b"\n\n") else {
-        return Err("annotated tag has no body".into());
+        return ExtractedArmor::Malformed("annotated tag has no body".into());
     };
     let body_start = sep + 2;
     let body = &raw_tag[body_start..];
@@ -284,7 +326,7 @@ pub fn extract_tag_imprint(raw_tag: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String>
         let line = body[off..line_end].strip_suffix(b"\r").unwrap_or(&body[off..line_end]);
         if line == X509_BEGIN {
             if begin_pos.is_some() {
-                return Err("annotated tag carries multiple imprint blocks".into());
+                return ExtractedArmor::Malformed("annotated tag carries multiple imprint blocks".into());
             }
             begin_pos = Some(body_start + off);
         }
@@ -294,25 +336,27 @@ pub fn extract_tag_imprint(raw_tag: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String>
         off = line_end + 1;
     }
 
-    let sig_start = begin_pos.ok_or_else(|| "annotated tag carries no BLINCS imprint".to_string())?;
-    Ok((raw_tag[..sig_start].to_vec(), raw_tag[sig_start..].to_vec()))
-}
-
-/// Produce a salted whole-snapshot BLINCS imprint over a Git commit or annotated tag payload.
-pub fn imprint_payload(repo: &mut GitRepo, signet: &Signet, rng: &Randomness, payload: &[u8]) -> Result<Imprint, String> {
-    let (ctx, reader) = if payload.starts_with(b"tree ") {
-        (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?)
-    } else if payload.starts_with(b"object ") {
-        (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?)
-    } else {
-        return Err("unsupported Git payload (expected commit or annotated tag)".into());
+    let Some(sig_start) = begin_pos else {
+        return ExtractedArmor::Absent;
     };
-    signet.imprint_reader(rng, ctx, reader).map_err(|e| format!("snapshot imprint failed: {e}"))
+    ExtractedArmor::Present { payload: raw_tag[..sig_start].to_vec(), armor: raw_tag[sig_start..].to_vec() }
 }
 
-/// Verify a salted whole-snapshot BLINCS imprint against `expected_id` (if given, `embedded_id == expected_id`
-/// is strictly enforced) and return the verified `SignetId`.
-pub fn verify_payload_imprint(repo: &mut GitRepo, payload: &[u8], armor: &[u8], expected_id: Option<&SignetId>) -> Result<SignetId, String> {
+/// Produce a salted whole-snapshot BLINCS imprint over an explicitly typed Git commit or annotated tag payload.
+pub fn imprint_payload(repo: &mut GitRepo, kind: ObjKind, signet: &Signet, rng: &Randomness, payload: &[u8]) -> Result<Imprint, String> {
+    let (ctx, mut reader) = match kind {
+        ObjKind::Commit => (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?),
+        ObjKind::Tag => (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?),
+        other => return Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
+    };
+    let res = signet.imprint_reader(rng, ctx, &mut reader).map_err(|e| format!("snapshot imprint failed: {e}"));
+    reader.finish_or_reset();
+    res
+}
+
+/// Verify a salted whole-snapshot BLINCS imprint over an explicitly typed Git commit or annotated tag
+/// payload against `expected_id` (if given, `embedded_id == expected_id` is strictly enforced).
+pub fn verify_payload_imprint(repo: &mut GitRepo, kind: ObjKind, payload: &[u8], armor: &[u8], expected_id: Option<&SignetId>) -> Result<SignetId, String> {
     let (embedded_id, imprint) = decode_imprint_armor(armor)?;
     if let Some(exp) = expected_id
         && embedded_id != *exp
@@ -323,16 +367,16 @@ pub fn verify_payload_imprint(repo: &mut GitRepo, payload: &[u8], armor: &[u8], 
             crate::id::format_signet_marker(&embedded_id)
         ));
     }
-    let (ctx, reader) = if payload.starts_with(b"tree ") {
-        (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?)
-    } else if payload.starts_with(b"object ") {
-        (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?)
-    } else {
-        return Err("unsupported Git payload (expected commit or annotated tag)".into());
+    let (ctx, mut reader) = match kind {
+        ObjKind::Commit => (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?),
+        ObjKind::Tag => (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?),
+        other => return Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
     };
-    match embedded_id.verify_reader(ctx, reader, &imprint) {
+    let res = match embedded_id.verify_reader(ctx, &mut reader, &imprint) {
         Ok(()) => Ok(embedded_id),
         Err(VerifyError::Invalid) => Err("BLINCS snapshot imprint verification FAILED".into()),
         Err(VerifyError::Io(e)) => Err(format!("snapshot verification I/O error: {e}")),
-    }
+    };
+    reader.finish_or_reset();
+    res
 }

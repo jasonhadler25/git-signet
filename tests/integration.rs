@@ -1,14 +1,21 @@
 include!("../tools/require_nextest.rs");
 
 use git_signet::blake3_chain::{
-    CommitClass, ContextKeys, DigestCache, attach_gpgsig, compute_commit_digest, insert_signet_headers, parse_commit, verify_commit_chain,
+    CTX_COMMIT, CTX_DIR, CTX_FILE, CTX_PLAIN, CommitClass, ContextKeys, DigestCache, attach_gpgsig, compute_commit_digest, compute_tree_digest,
+    hash_blob_streaming, insert_signet_headers, parse_commit, verify_commit_chain,
 };
-use git_signet::git::{GitRepo, ObjKind, resolve_real_git};
+use git_signet::git::{GitRepo, ObjKind, ZERO_OID, is_wrapper_script, parse_git_tree, resolve_real_git, sanitize_for_tty};
+use git_signet::hooks::{
+    add_blake3_headers_to_commit, check_revision, governing_signet, load_signet_from_path, load_signet_from_spec, parse_reference_transaction_records,
+    randomness_state_dir, verify_ref_batch,
+};
 use git_signet::id::{
-    decode_imprint_armor, decode_signet_b32, encode_imprint_armor, encode_signet_b32, extract_blake3_pin_from_refname, extract_signet_from_refname,
-    extract_signet_from_remote_url, format_signet_marker, parse_signet_marker, to_hex,
+    base64_decode, base64_encode, decode_imprint_armor, decode_lower_hex, decode_signet_b32, encode_imprint_armor, encode_signet_b32,
+    extract_blake3_pin_from_refname, extract_signet_from_refname, extract_signet_from_remote_url, format_signet_marker, parse_signet_marker, to_hex,
 };
-use git_signet::snapshot::{COMMIT_SNAPSHOT_CTX, SnapshotReader, TAG_SNAPSHOT_CTX, extract_commit_imprint, imprint_payload, verify_payload_imprint};
+use git_signet::snapshot::{
+    COMMIT_SNAPSHOT_CTX, ExtractedArmor, SnapshotReader, TAG_SNAPSHOT_CTX, extract_commit_imprint, extract_tag_imprint, imprint_payload, verify_payload_imprint,
+};
 use signet::{Context, Randomness, SEED_LEN, Signet, SignetId};
 use std::fs;
 use std::io::Read;
@@ -436,7 +443,13 @@ fn formal_transitive_closure_old_tags_and_rogue_tag_rejection() {
     env.git_ok(&rogue, &["add", "r.txt"]);
     env.git_ok(&rogue, &["commit", "--no-gpg-sign", "-m", "rogue orphan"]);
     env.git_ok(&rogue, &["tag", "v-rogue"]);
-    env.git_ok(&rogue, &["push", bound_remote.to_str().unwrap(), "refs/tags/v-rogue"]);
+    // Now push a ROGUE unsigned commit R NOT in B's ancestor closure under tag `v-rogue`:
+    // 1. Server-side bare-repo enforcement rejects the rogue push directly!
+    let rogue_push_blocked = env.git(&rogue, &["push", bound_remote.to_str().unwrap(), "refs/tags/v-rogue"]);
+    assert!(!rogue_push_blocked.status.success(), "bare signet-bound remote unexpectedly accepted rogue tag push!");
+    // 2. Simulate a compromised remote (GIT_SIGNET_SKIP_HOOK=1) -> client `git fetch` MUST ALSO REJECT!
+    let rogue_push_compromised = env.git_with_env(&rogue, &["push", bound_remote.to_str().unwrap(), "refs/tags/v-rogue"], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+    assert!(rogue_push_compromised.status.success());
 
     let fetch_rogue = env.git(&client, &["fetch", "origin", "--tags"]);
     assert!(!fetch_rogue.status.success(), "fetch unexpectedly accepted rogue tag outside transitive closure!");
@@ -460,7 +473,7 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     // Annotated imprinted tag (`git tag -s`) covers tag + target commit + target tree!
     env.git_ok(&work, &["tag", "-s", "v1.0", "-m", "imprinted release tag"]);
     let chk_tag = env.signet_ok(&work, &["check", "v1.0", "--signet", &marker]);
-    assert!(chk_tag.contains("direct salted snapshot imprint"));
+    assert!(chk_tag.contains("direct salted annotated-tag imprint"));
 
     // Check digest-bound ref (`+blake3-<exact>` passes, wrong digest rejected).
     let b3_id = env.signet_ok(&work, &["id", "HEAD"]).trim().to_owned();
@@ -477,11 +490,13 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     let mut repo = GitRepo::open(Some(&work)).unwrap();
     let head_oid = repo.rev_parse("HEAD").unwrap();
     let (_, raw_commit) = repo.read_object(&head_oid).unwrap();
-    let (payload, armor) = extract_commit_imprint(&raw_commit).unwrap();
+    let ExtractedArmor::Present { payload, armor } = extract_commit_imprint(&raw_commit) else {
+        panic!("expected commit imprint");
+    };
 
     // Valid snapshot verifies cleanly under COMMIT_SNAPSHOT_CTX (rejects wrong/empty Context)
     // and streams the actual file contents directly!
-    let sid = verify_payload_imprint(&mut repo, &payload, &armor, None).unwrap();
+    let sid = verify_payload_imprint(&mut repo, ObjKind::Commit, &payload, &armor, None).unwrap();
     let (_, decoded_imp) = decode_imprint_armor(&armor).unwrap();
     let mut snap_bytes = Vec::new();
     SnapshotReader::for_commit(&mut repo, &payload).unwrap().read_to_end(&mut snap_bytes).unwrap();
@@ -502,7 +517,7 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     let bad_payload = insert_signet_headers(&raw_commit, &parsed.tree, &bad_tree_dig, &[]).unwrap();
     let bad_oid = repo.hash_object_write(ObjKind::Commit, &bad_payload).unwrap();
     let ctx = ContextKeys::new();
-    assert!(verify_commit_chain(&mut repo, &ctx, &bad_oid, None, false, None).is_err(), "accepted forged signet-tree digest!");
+    assert!(verify_commit_chain(&mut repo, &ctx, &bad_oid, None, false).is_err(), "accepted forged signet-tree digest!");
 
     // Tamper tree content under the same commit payload (new blob -> new tree -> swap tree OID into payload)
     // while keeping original armor -> BLINCS snapshot verifier rejects!
@@ -512,7 +527,10 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     evil_tree_raw.extend_from_slice(&evil_blob);
     let evil_tree = repo.hash_object_write(ObjKind::Tree, &evil_tree_raw).unwrap();
     let swapped_payload = String::from_utf8(payload.clone()).unwrap().replace(&to_hex(&parsed.tree), &to_hex(&evil_tree)).into_bytes();
-    assert!(verify_payload_imprint(&mut repo, &swapped_payload, &armor, Some(&sid)).is_err(), "accepted swapped tree under old BLINCS imprint!");
+    assert!(
+        verify_payload_imprint(&mut repo, ObjKind::Commit, &swapped_payload, &armor, Some(&sid)).is_err(),
+        "accepted swapped tree under old BLINCS imprint!"
+    );
 
     // Stale amend check: single signet-tree whose tree OID != commit's tree is treated as Stale (plain),
     // while duplicate signet-tree is rejected as malformed!
@@ -522,15 +540,619 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     // Confirm `imprint_payload` + `attach_gpgsig` round-trip directly through library API too.
     let rng = Randomness::initialize(env.config_dir.join("randomness")).unwrap();
     let signet = Signet::from_seed(&[0x33u8; SEED_LEN]);
-    let imp2 = imprint_payload(&mut repo, &signet, &rng, &payload).unwrap();
+    let imp2 = imprint_payload(&mut repo, ObjKind::Commit, &signet, &rng, &payload).unwrap();
     let armor2 = encode_imprint_armor(&signet.id(), &imp2);
     let combined = attach_gpgsig(&payload, &armor2);
-    let (p2, a2) = extract_commit_imprint(&combined).unwrap();
+    let ExtractedArmor::Present { payload: p2, armor: a2 } = extract_commit_imprint(&combined) else {
+        panic!("expected combined commit imprint");
+    };
     assert_eq!(p2, payload);
-    assert_eq!(verify_payload_imprint(&mut repo, &p2, &a2, Some(&signet.id())).unwrap(), signet.id());
+    assert_eq!(verify_payload_imprint(&mut repo, ObjKind::Commit, &p2, &a2, Some(&signet.id())).unwrap(), signet.id());
+    assert!(verify_payload_imprint(&mut repo, ObjKind::Commit, &p2, &a2, Some(&SignetId::from_bytes(&[0x99u8; 32]))).is_err());
 
     // Confirm `compute_commit_digest` works cleanly with memory-only cache.
     let mut cache = DigestCache::memory_only();
     let d = compute_commit_digest(&mut repo, &ctx, &head_oid, &mut cache).unwrap();
     assert_eq!(to_hex(&d), b3_id);
+}
+
+#[test]
+fn codec_cache_and_blake3_kats() {
+    // 1. Base64 strict round-trip across 0, 1, 2, 3 byte remainders + non-canonical padding rejection.
+    for sample in [b"".as_slice(), b"a", b"ab", b"abc", b"abcd", &[0x00, 0xff, 0x55, 0xaa, 0x12]] {
+        let enc = base64_encode(sample);
+        if sample.is_empty() {
+            assert_eq!(enc, "");
+            assert!(base64_decode("").is_err());
+        } else {
+            assert_eq!(base64_decode(&enc).unwrap(), sample);
+        }
+    }
+    assert!(base64_decode("AAA").is_err()); // non-multiple of 4
+    assert!(base64_decode("AA==AA==").is_err()); // padding before end
+    assert!(base64_decode("AB==").is_err()); // pad==2 non-zero trailing bits (v1 = 1)
+    assert!(base64_decode("AAB=").is_err()); // pad==1 non-zero trailing bits (v2 = 1)
+    assert!(base64_decode("AA$=").is_err()); // invalid char
+
+    // 2. Armor structural rejections (<3 lines, wrong begin/end, blank line, non-UTF-8).
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\n-----END SIGNED MESSAGE-----\n").is_err());
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\nAAAA\n\n-----END SIGNED MESSAGE-----\n").is_err());
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\n\xff\xff\xff\xff\n-----END SIGNED MESSAGE-----\n").is_err());
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\nAAAA\n-----END WRONG-----\n").is_err());
+
+    // 3. Refname & remote URL edge cases (walk operators, duplicate vs conflicting pins/IDs).
+    let id1 = SignetId::from_bytes(&[0x11u8; 32]);
+    let id2 = SignetId::from_bytes(&[0x22u8; 32]);
+    let m1 = format_signet_marker(&id1);
+    let m2 = format_signet_marker(&id2);
+    assert_eq!(extract_signet_from_refname(&format!("refs/heads/{m1}.{m1}")).unwrap(), Some(id1));
+    assert!(extract_signet_from_refname(&format!("refs/heads/{m1}.{m2}")).is_err());
+    assert!(extract_signet_from_refname(&format!("main+{m1}^2")).is_err());
+    assert_eq!(extract_signet_from_remote_url(&format!("https://host/org/r.{m1}.git?x=1#frag")).unwrap(), Some(id1));
+    assert_eq!(extract_signet_from_remote_url("   ").unwrap(), None);
+
+    let d1 = [0x11u8; 32];
+    let d2 = [0x22u8; 32];
+    let h1 = to_hex(&d1);
+    let h2 = to_hex(&d2);
+    assert_eq!(extract_blake3_pin_from_refname(&format!("refs/tags/v1+blake3-{h1}.blake3-{h1}")).unwrap(), Some(d1));
+    assert!(extract_blake3_pin_from_refname(&format!("refs/tags/v1+blake3-{h1}+blake3-{h2}")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("refs/tags/v1+blake3-{}", "a".repeat(45))).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{h1}~1")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{h1}^1")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{h1}..HEAD")).is_err());
+
+    // 4. Independent BLAKE3 DeriveKey KATs on ContextKeys (catches zeroed/wrong hashers!).
+    let ctx = ContextKeys::new();
+    let msg = b"git-signet KAT payload 0123456789";
+    let expected = |context: &str| *blake3_servil_core::convenience::hash_with(blake3_servil_core::Mode::DeriveKey(context), msg).as_bytes();
+    assert_eq!(ctx.hash_file(msg), expected(CTX_FILE));
+    assert_eq!(ctx.hash_dir(msg), expected(CTX_DIR));
+    assert_eq!(ctx.hash_carrying_commit(msg), expected(CTX_COMMIT));
+    assert_eq!(ctx.hash_plain_commit(msg), expected(CTX_PLAIN));
+    assert_ne!(ctx.hash_file(msg), [0u8; 32]);
+    assert_ne!(ctx.hash_file(msg), ctx.hash_dir(msg));
+    assert_ne!(ctx.hash_carrying_commit(msg), ctx.hash_plain_commit(msg));
+
+    // 5. Memory-only DigestCache round-trip & subtree height tracking.
+    let mut cache = DigestCache::memory_only();
+    let (oid_b, oid_t, oid_c) = ([1u8; 20], [2u8; 20], [3u8; 20]);
+    let (dig_b, dig_t, dig_c) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+    assert_eq!(cache.get_blob(&oid_b), None);
+    cache.put_blob(oid_b, dig_b);
+    cache.put_tree(oid_t, dig_t, 2);
+    cache.put_commit(oid_c, dig_c);
+    assert_eq!(cache.get_blob(&oid_b), Some(dig_b));
+    assert_eq!(cache.get_tree(&oid_t), Some((dig_t, 2)));
+    assert_eq!(cache.get_commit(&oid_c), Some(dig_c));
+
+    // 6. sanitize_for_tty (including bidi override chars), parse_git_tree edge cases, and is_wrapper_script.
+    let tmp = temp_dir("cache-kat");
+    assert_eq!(sanitize_for_tty("refs/heads/\x1b[31mmain\x00\n\u{202E}x"), "refs/heads/?[31mmain???x");
+    assert!(!is_wrapper_script(&tmp.join("does-not-exist")));
+    fs::write(tmp.join("not-wrapper"), b"#!/bin/sh\necho hi\n").unwrap();
+    assert!(!is_wrapper_script(&tmp.join("not-wrapper")));
+    let mut raw_tree = Vec::new();
+    raw_tree.extend_from_slice(b"100755 run.sh\0");
+    raw_tree.extend_from_slice(&[0xaa; 20]);
+    raw_tree.extend_from_slice(b"160000 sub\0");
+    raw_tree.extend_from_slice(&[0xbb; 20]);
+    raw_tree.extend_from_slice(b"40000 dir\0");
+    raw_tree.extend_from_slice(&[0xcc; 20]);
+    let entries = parse_git_tree(&raw_tree).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(!entries[0].is_dir && !entries[0].is_gitlink);
+    assert!(entries[1].is_gitlink && !entries[1].is_dir);
+    assert!(entries[2].is_dir && !entries[2].is_gitlink);
+    assert!(parse_git_tree(b"100644 truncated\0short").is_err());
+    assert!(parse_git_tree(b"badentry").is_err());
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn cli_subcommands_wrapper_disable_and_missing_policy() {
+    let env = TestEnv::new("cli-extra");
+    let bin_dir = env.root.join("bin");
+
+    // enable rejects --global + --local together; accepts --global --wrapper-dir.
+    assert!(!env.signet(&env.root, &["enable", "--global", "--local"]).status.success());
+    assert!(!env.signet(&env.root, &["check", "--unknown-flag"]).status.success());
+    env.signet_ok(&env.root, &["enable", "--global", "--wrapper-dir", bin_dir.to_str().unwrap()]);
+    assert!(is_wrapper_script(&bin_dir.join("git")));
+
+    // keygen + format-id + bad seed rejection.
+    let seed_path = env.root.join("k.seed");
+    let out = env.signet_ok(&env.root, &["keygen", "--file", seed_path.to_str().unwrap()]);
+    let marker = out.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let fmt_id = env.signet_ok(&env.root, &["format-id", seed_path.to_str().unwrap()]);
+    assert_eq!(fmt_id.trim(), marker);
+    let bad_seed = env.root.join("old.seed");
+    let mut old_raw = [0u8; 40];
+    old_raw[..8].copy_from_slice(b"BLINCSs1");
+    fs::write(&bad_seed, old_raw).unwrap();
+    assert!(load_signet_from_path(&bad_seed).is_err());
+    assert!(load_signet_from_spec(&format_signet_marker(&SignetId::from_bytes(&[0x99; 32]))).is_err());
+    assert!(randomness_state_dir().is_ok());
+
+    // Init repo, commit, test `git signet id` (default HEAD), `git -C` / `-c` wrapper forwarding, and rebase (`post-rewrite`).
+    let work = env.root.join("work");
+    env.git_ok(&env.root, &["init", work.to_str().unwrap()]);
+    fs::write(work.join("a.txt"), b"hello\n").unwrap();
+    env.git_ok(&work, &["add", "a.txt"]);
+    env.git_ok(&work, &["commit", "-m", "c1"]);
+    let id_default = env.signet_ok(&work, &["id"]).trim().to_owned();
+    let id_head = env.signet_ok(&work, &["id", "HEAD"]).trim().to_owned();
+    assert_eq!(id_default, id_head);
+
+    // Direct streaming blob + tree digest match ContextKeys KAT!
+    let mut repo = GitRepo::open(Some(&work)).unwrap();
+    assert_eq!(repo.config_get_bool("core.bare"), Some(false));
+    let ctx = ContextKeys::new();
+    let mut cache = DigestCache::memory_only();
+    let head_oid = repo.rev_parse("HEAD").unwrap();
+    let (_, raw_c) = repo.read_object(&head_oid).unwrap();
+    let parsed = parse_commit(raw_c).unwrap();
+    let tree_dig = compute_tree_digest(&mut repo, &ctx, &parsed.tree, &mut cache).unwrap();
+    assert_ne!(tree_dig, [0u8; 32]);
+    let (_, tree_raw) = repo.read_object(&parsed.tree).unwrap();
+    let blob_oid = parse_git_tree(&tree_raw).unwrap()[0].oid;
+    assert_eq!(hash_blob_streaming(&mut repo, &ctx, &blob_oid, &mut cache).unwrap(), ctx.hash_file(b"hello\n"));
+
+    // Wrapper with `-C <work>` and `-c color.ui=false` runs fsck cleanly and propagates git error codes!
+    let wrap_c = Command::new(bin_dir.join("git"))
+        .current_dir(&env.root)
+        .env("HOME", &env.home)
+        .env("GIT_SIGNET_CONFIG_DIR", &env.config_dir)
+        .env("GIT_SIGNET_REAL_GIT", &env.real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "color.ui=false", "-C", work.to_str().unwrap(), "fsck"])
+        .output()
+        .unwrap();
+    assert!(wrap_c.status.success());
+    let wrap_fail = Command::new(bin_dir.join("git"))
+        .current_dir(&work)
+        .env("HOME", &env.home)
+        .env("GIT_SIGNET_CONFIG_DIR", &env.config_dir)
+        .env("GIT_SIGNET_REAL_GIT", &env.real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["rev-parse", "--verify", "refs/heads/does-not-exist"])
+        .output()
+        .unwrap();
+    assert!(!wrap_fail.status.success());
+
+    // `signet.missing=error` and `signet.missing=warn` on a plain remote fetch.
+    let plain_remote = env.root.join("plain-missing.git");
+    fs::create_dir_all(&plain_remote).unwrap();
+    env.git_ok(&plain_remote, &["init", "--bare"]);
+    let up = env.root.join("up");
+    env.git_ok(&env.root, &["clone", plain_remote.to_str().unwrap(), up.to_str().unwrap()]);
+    fs::write(up.join("p.txt"), b"plain\n").unwrap();
+    env.git_ok(&up, &["add", "p.txt"]);
+    assert!(env.git_with_env(&up, &["commit", "-m", "plain"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    assert!(env.git_with_env(&up, &["push", "origin", "main"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+
+    let strict_client = env.root.join("strict-client");
+    env.git_ok(&env.root, &["init", strict_client.to_str().unwrap()]);
+    env.git_ok(&strict_client, &["remote", "add", "origin", plain_remote.to_str().unwrap()]);
+    env.git_ok(&strict_client, &["config", "--local", "signet.missing", "error"]);
+    assert!(!env.git(&strict_client, &["fetch", "origin"]).status.success(), "signet.missing=error accepted plain commit!");
+    env.git_ok(&strict_client, &["config", "--local", "signet.missing", "warn"]);
+    let warn_fetch = env.git(&strict_client, &["fetch", "origin"]);
+    assert!(warn_fetch.status.success());
+    assert!(String::from_utf8_lossy(&warn_fetch.stderr).contains("warning"));
+
+    // disable cleans up wrapper & global hooks.
+    env.signet_ok(&env.root, &["disable", "--global", "--wrapper-dir", bin_dir.to_str().unwrap()]);
+    assert!(!bin_dir.join("git").exists());
+}
+
+#[test]
+fn adversarial_headers_conflicts_and_gitlink_snapshot() {
+    let env = TestEnv::new("adv-headers");
+    env.signet_ok(&env.root, &["enable", "--global"]);
+    let out_a = env.signet_ok(&env.root, &["keygen"]);
+    let marker_a = out_a.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let id_b = SignetId::from_bytes(&[0x77u8; 32]);
+    let marker_b = format_signet_marker(&id_b);
+
+    // 1. Conflicting signet IDs between remote URL (A) and remote-tracking refname (B) rejected by governing_signet!
+    let repo_dir = env.root.join("conflict-repo");
+    env.git_ok(&env.root, &["init", repo_dir.to_str().unwrap()]);
+    env.git_ok(&repo_dir, &["remote", "add", "origin", &format!("https://example.invalid/org/p.{marker_a}.git")]);
+    let repo = GitRepo::open(Some(&repo_dir)).unwrap();
+    assert!(governing_signet(&repo, &format!("refs/remotes/origin/main+{marker_b}"), None).is_err());
+    assert_eq!(governing_signet(&repo, &format!("refs/remotes/origin/main+{marker_a}"), None).unwrap(), Some(parse_signet_marker(&marker_a).unwrap()));
+
+    // 2. Malformed signet headers rejected by parse_commit (`signet-parent` without `signet-tree`, duplicate `signet-tree`, wrong parent count).
+    let base_commit = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n";
+    let hex64 = "0".repeat(64);
+    let parent_only = format!("{}signet-parent blake3 {hex64}\n\nmsg\n", std::str::from_utf8(base_commit).unwrap());
+    assert!(parse_commit(parent_only.into_bytes()).is_err());
+    let dup_tree = format!(
+        "{}signet-tree blake3 4b825dc642cb6eb9a060e54bf8d69288fbee4904 {hex64}\nsignet-tree blake3 4b825dc642cb6eb9a060e54bf8d69288fbee4904 {hex64}\n\nmsg\n",
+        std::str::from_utf8(base_commit).unwrap()
+    );
+    assert!(parse_commit(dup_tree.into_bytes()).is_err());
+    let wrong_parent_cnt = format!(
+        "{}signet-tree blake3 4b825dc642cb6eb9a060e54bf8d69288fbee4904 {hex64}\nsignet-parent blake3 {hex64}\n\nmsg\n",
+        std::str::from_utf8(base_commit).unwrap()
+    );
+    assert!(parse_commit(wrong_parent_cnt.into_bytes()).is_err());
+
+    // 3. Duplicate gpgsig header & duplicate tag imprint block rejected as Malformed.
+    let dup_gpgsig = format!(
+        "{}gpgsig -----BEGIN SIGNED MESSAGE-----\n AAAA\ngpgsig -----BEGIN SIGNED MESSAGE-----\n BBBB\n\nmsg\n",
+        std::str::from_utf8(base_commit).unwrap()
+    );
+    assert!(matches!(extract_commit_imprint(dup_gpgsig.as_bytes()), ExtractedArmor::Malformed(_)));
+    let dup_tag = b"object 0000000000000000000000000000000000000000\ntype commit\ntag v1\ntagger A <a@b> 1 +0000\n\nhi\n-----BEGIN SIGNED MESSAGE-----\nA\n-----END SIGNED MESSAGE-----\n-----BEGIN SIGNED MESSAGE-----\nB\n-----END SIGNED MESSAGE-----\n";
+    assert!(matches!(extract_tag_imprint(dup_tag), ExtractedArmor::Malformed(_)));
+
+    // 4. Tree containing a gitlink (`160000`) hashes cleanly in BOTH compute_tree_digest and SnapshotReader!
+    let mut repo = GitRepo::open(Some(&repo_dir)).unwrap();
+    let blob_oid = repo.hash_object_write(ObjKind::Blob, b"with-gitlink\n").unwrap();
+    let gitlink_oid = [0x42u8; 20];
+    let mut tree_raw = Vec::new();
+    tree_raw.extend_from_slice(b"100644 file.txt\0");
+    tree_raw.extend_from_slice(&blob_oid);
+    tree_raw.extend_from_slice(b"160000 submod\0");
+    tree_raw.extend_from_slice(&gitlink_oid);
+    let tree_oid = repo.hash_object_write(ObjKind::Tree, &tree_raw).unwrap();
+    let commit_payload = format!("tree {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\ngitlink commit\n", to_hex(&tree_oid));
+    let mut snap = Vec::new();
+    SnapshotReader::for_commit(&mut repo, commit_payload.as_bytes()).unwrap().read_to_end(&mut snap).unwrap();
+    assert!(snap.windows(b"G160000 submod\0".len()).any(|w| w == b"G160000 submod\0"));
+    let ctx = ContextKeys::new();
+    let mut cache = DigestCache::memory_only();
+    let td = compute_tree_digest(&mut repo, &ctx, &tree_oid, &mut cache).unwrap();
+    assert_ne!(td, [0u8; 32]);
+}
+
+#[test]
+fn astra_security_regressions_c1_c2_h1_h3_h4_h5_m2_m3_m9() {
+    let env = TestEnv::new("astra-sec");
+    let bin_dir = env.root.join("bin");
+    env.signet_ok(&env.root, &["enable", "--global", "--wrapper-dir", bin_dir.to_str().unwrap()]);
+    let out_a = env.signet_ok(&env.root, &["keygen"]);
+    let marker_a = out_a.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let sid_a = parse_signet_marker(&marker_a).unwrap();
+    let seed_a_path = env.config_dir.join("signets").join(format!("{marker_a}.seed"));
+    let signet_a = load_signet_from_path(&seed_a_path).unwrap();
+
+    // C2: Byte-exact reference-transaction parsing preserves Unicode whitespace inside refnames
+    // and fails closed on malformed lines or bad hex OIDs.
+    let zero_hex = "0".repeat(40);
+    let one_hex = "1".repeat(40);
+    let nbsp_ref = "refs/heads/feat\u{00A0}nbsp";
+    let raw_tx = format!("{zero_hex} {one_hex} {nbsp_ref}\n");
+    let recs = parse_reference_transaction_records(raw_tx.as_bytes()).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].refname, nbsp_ref);
+    assert!(parse_reference_transaction_records(b"only-two fields\n").is_err());
+    assert!(parse_reference_transaction_records(format!("not-hex {one_hex} refs/heads/a\n").as_bytes()).is_err());
+    assert!(parse_reference_transaction_records(format!("{zero_hex} not-hex refs/heads/a\n").as_bytes()).is_err());
+
+    // C1: An unverified / forged BLINCSg2 armor claiming sid_a MUST NOT cause add_blake3_headers_to_commit
+    // to sign with local signet A, even when user.signingkey IS configured!
+    let repo_dir = env.root.join("c1-repo");
+    env.git_ok(&env.root, &["init", repo_dir.to_str().unwrap()]);
+    env.signet_ok(&repo_dir, &["imprint-here", seed_a_path.to_str().unwrap()]);
+    fs::write(repo_dir.join("x.txt"), b"x\n").unwrap();
+    env.git_ok(&repo_dir, &["add", "x.txt"]);
+    env.git_ok(&repo_dir, &["commit", "-m", "legit"]);
+    // H5: stock `git log -1 --format=%G?` reports `U` (TRUST_UNDEFINED), NOT `G` (TRUST_FULLY), while verify-commit exits 0!
+    env.git_ok(&repo_dir, &["verify-commit", "HEAD"]);
+    let g_status = env.git_ok(&repo_dir, &["log", "-1", "--format=%G?"]);
+    assert_eq!(g_status.trim(), "U", "x509 verifier falsely claimed TRUST_FULLY instead of TRUST_UNDEFINED");
+
+    let mut repo = GitRepo::open(Some(&repo_dir)).unwrap();
+    let legit_oid = repo.rev_parse("HEAD").unwrap();
+    let (_, legit_raw) = repo.read_object(&legit_oid).unwrap();
+    let tree_oid = parse_commit(legit_raw).unwrap().tree;
+    let fake_imp = signet::Imprint::from_bytes(&[0x42u8; signet::IMPRINT_LEN]);
+    let forged_armor = encode_imprint_armor(&sid_a, &fake_imp);
+    let plain_payload = format!("tree {}\nauthor Evil <e@e> 1 +0000\ncommitter Evil <e@e> 1 +0000\n\nforged claim\n", to_hex(&tree_oid));
+    let forged_commit = attach_gpgsig(plain_payload.as_bytes(), &forged_armor);
+    let forged_oid = repo.hash_object_write(ObjKind::Commit, &forged_commit).unwrap();
+    assert!(add_blake3_headers_to_commit(&mut repo, &forged_oid).is_err(), "C1 regression: hook re-imprinted commit with unverified/forged BLINCS armor!");
+
+    // C1 (second half): Even a VALID plain commit imprinted by signet A MUST NOT be re-imprinted
+    // in a repository where user.signingkey is NOT configured (no fallback to global signets dir)!
+    let other_dir = env.root.join("c1-unconfigured");
+    env.git_ok(&env.root, &["init", other_dir.to_str().unwrap()]);
+    fs::write(other_dir.join("y.txt"), b"y\n").unwrap();
+    env.git_ok(&other_dir, &["add", "y.txt"]);
+    assert!(env.git_with_env(&other_dir, &["commit", "-m", "plain"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let mut repo2 = GitRepo::open(Some(&other_dir)).unwrap();
+    let p_oid = repo2.rev_parse("HEAD").unwrap();
+    let (_, p_raw) = repo2.read_object(&p_oid).unwrap();
+    let rng = Randomness::initialize(env.config_dir.join("randomness")).unwrap();
+    let valid_imp_on_plain = imprint_payload(&mut repo2, ObjKind::Commit, &signet_a, &rng, &p_raw).unwrap();
+    let valid_plain_commit = attach_gpgsig(&p_raw, &encode_imprint_armor(&sid_a, &valid_imp_on_plain));
+    let vp_oid = repo2.hash_object_write(ObjKind::Commit, &valid_plain_commit).unwrap();
+    assert!(add_blake3_headers_to_commit(&mut repo2, &vp_oid).is_err(), "C1 regression: fell back to global signets/ without active user.signingkey!");
+
+    // H1: A directly imprinted ANNOTATED TAG over an unimprinted plain commit authorizes THAT tag,
+    // NEVER seeding transitive-closure delegation for another ref pointing to an ancestor commit!
+    let bare_a = env.root.join(format!("bare.{marker_a}.git"));
+    fs::create_dir_all(&bare_a).unwrap();
+    env.git_ok(&bare_a, &["init", "--bare"]);
+    // H3: bare repository named `bare.<marker_a>.git` with ZERO remotes governs its refs!
+    let bare_repo_ro = GitRepo::open(Some(&bare_a)).unwrap();
+    assert_eq!(governing_signet(&bare_repo_ro, "refs/heads/main", None).unwrap(), Some(sid_a));
+
+    let tag_work = env.root.join("h1-work");
+    env.git_ok(&env.root, &["init", tag_work.to_str().unwrap()]);
+    fs::write(tag_work.join("a.txt"), b"a\n").unwrap();
+    env.git_ok(&tag_work, &["add", "a.txt"]);
+    assert!(env.git_with_env(&tag_work, &["commit", "-m", "anc"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let anc_oid_hex = env.git_ok(&tag_work, &["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(tag_work.join("b.txt"), b"b\n").unwrap();
+    env.git_ok(&tag_work, &["add", "b.txt"]);
+    assert!(env.git_with_env(&tag_work, &["commit", "-m", "child"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    env.signet_ok(&tag_work, &["imprint-here", seed_a_path.to_str().unwrap()]);
+    env.git_ok(&tag_work, &["tag", "-s", "v-tag-only", "-m", "tag imprint"]);
+    let mut w_repo = GitRepo::open(Some(&tag_work)).unwrap();
+    let tag_oid = w_repo.rev_parse("refs/tags/v-tag-only").unwrap();
+    let anc_oid = w_repo.rev_parse(&anc_oid_hex).unwrap();
+    let tag_ref = format!("refs/tags/v-tag-only+{marker_a}");
+    let anc_ref = format!("refs/tags/anc+{marker_a}");
+    assert!(verify_ref_batch(&mut w_repo, &[(tag_ref.clone(), ZERO_OID, tag_oid)], false).is_ok());
+    assert!(
+        verify_ref_batch(&mut w_repo, &[(tag_ref, ZERO_OID, tag_oid), (anc_ref.clone(), ZERO_OID, anc_oid)], false).is_err(),
+        "H1 regression: annotated tag imprint delegated closure authority to unsigned ancestor ref!"
+    );
+
+    // H1 (part 2): A directly imprinted PLAIN commit (no signet-parent) authorizes itself, NOT its unimprinted ancestor!
+    let mut repo2 = GitRepo::open(Some(&other_dir)).unwrap();
+    fs::write(other_dir.join("z.txt"), b"z\n").unwrap();
+    env.git_ok(&other_dir, &["add", "z.txt"]);
+    assert!(env.git_with_env(&other_dir, &["commit", "-m", "child-plain"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let c2_oid = repo2.rev_parse("HEAD").unwrap();
+    let (_, c2_raw) = repo2.read_object(&c2_oid).unwrap();
+    let c2_imp = imprint_payload(&mut repo2, ObjKind::Commit, &signet_a, &rng, &c2_raw).unwrap();
+    let c2_signed_plain = attach_gpgsig(&c2_raw, &encode_imprint_armor(&sid_a, &c2_imp));
+    let c2_sp_oid = repo2.hash_object_write(ObjKind::Commit, &c2_signed_plain).unwrap();
+    let sp_ref = format!("refs/tags/sp+{marker_a}");
+    assert!(verify_ref_batch(&mut repo2, &[(sp_ref.clone(), ZERO_OID, c2_sp_oid)], false).is_ok());
+    assert!(
+        verify_ref_batch(&mut repo2, &[(sp_ref, ZERO_OID, c2_sp_oid), (anc_ref, ZERO_OID, p_oid)], false).is_err(),
+        "H1 regression: directly imprinted plain commit (no signet-parent) authorized unsigned parent!"
+    );
+
+    // H4: Prepared reference-transaction hook is strictly READ-ONLY (creating a signet-named local branch
+    // does NOT write `include.path` into `.git/config`!).
+    let ro_dir = env.root.join("h4-ro");
+    env.git_ok(&env.root, &["init", ro_dir.to_str().unwrap()]);
+    env.git_ok(&ro_dir, &["checkout", "-b", &format!("dev+{marker_a}")]);
+    let local_cfg = fs::read_to_string(ro_dir.join(".git/config")).unwrap();
+    assert!(!local_cfg.contains("include.path") && !local_cfg.contains("[include]"), "H4 regression: prepared hook mutated .git/config:\n{local_cfg}");
+
+    // H5: check_revision rejects conflicting --expect vs refname `+blake3-` pin AND conflicting --signet vs ref signet!
+    // Put a WRONG pin on the tag and pass the ACTUAL head_b3 as --expect so an override bug would falsely succeed!
+    let mut repo = GitRepo::open(Some(&repo_dir)).unwrap();
+    let head_b3 = env.signet_ok(&repo_dir, &["id", "HEAD"]).trim().to_owned();
+    let head_b3_bytes = decode_lower_hex::<32>(&head_b3).unwrap();
+    let other_b3 = [0xeeu8; 32];
+    let other_sid = SignetId::from_bytes(&[0xeeu8; 32]);
+    let bad_pin_tag = format!("badpin+blake3-{}+{marker_a}", to_hex(&other_b3));
+    env.git_with_env(&repo_dir, &["tag", &bad_pin_tag], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+    assert!(
+        check_revision(&mut repo, &bad_pin_tag, None, Some(&head_b3_bytes), false).is_err(),
+        "H5 regression: --expect overrode conflicting refname +blake3- pin!"
+    );
+    env.git_ok(&repo_dir, &["tag", &format!("pin+blake3-{head_b3}+{marker_a}")]);
+    assert!(check_revision(&mut repo, &format!("pin+blake3-{head_b3}+{marker_a}"), None, Some(&other_b3), false).is_err());
+    assert!(check_revision(&mut repo, &format!("pin+blake3-{head_b3}+{marker_a}"), Some(&other_sid), None, false).is_err());
+    let _ = env.git_with_env(&repo_dir, &["tag", "-d", &bad_pin_tag], &[("GIT_SIGNET_SKIP_HOOK", "1")]);
+
+    // M3: Disappearing witness — deleting the only imprinted ref in the SAME transaction as introducing
+    // an unsigned ancestor tag MUST be rejected!
+    let m3_dir = env.root.join("m3-witness");
+    env.git_ok(&env.root, &["init", m3_dir.to_str().unwrap()]);
+    fs::write(m3_dir.join("1.txt"), b"1\n").unwrap();
+    env.git_ok(&m3_dir, &["add", "1.txt"]);
+    assert!(env.git_with_env(&m3_dir, &["commit", "-m", "old"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let old_oid_hex = env.git_ok(&m3_dir, &["rev-parse", "HEAD"]).trim().to_owned();
+    env.signet_ok(&m3_dir, &["imprint-here", seed_a_path.to_str().unwrap()]);
+    fs::write(m3_dir.join("2.txt"), b"2\n").unwrap();
+    env.git_ok(&m3_dir, &["add", "2.txt"]);
+    env.git_ok(&m3_dir, &["commit", "-m", "carrying imprinted tip"]);
+    let tip_oid_hex = env.git_ok(&m3_dir, &["rev-parse", "HEAD"]).trim().to_owned();
+    let witness_ref = format!("refs/tags/witness+{marker_a}");
+    env.git_ok(&m3_dir, &["update-ref", &witness_ref, &tip_oid_hex]);
+    let mut m3_repo = GitRepo::open(Some(&m3_dir)).unwrap();
+    let old_oid = m3_repo.rev_parse(&old_oid_hex).unwrap();
+    let tip_oid = m3_repo.rev_parse(&tip_oid_hex).unwrap();
+    let orphan_tag = format!("refs/tags/old+{marker_a}");
+    assert!(verify_ref_batch(&mut m3_repo, &[(orphan_tag.clone(), ZERO_OID, old_oid)], false).is_ok());
+    assert!(
+        verify_ref_batch(&mut m3_repo, &[(witness_ref, tip_oid, ZERO_OID), (orphan_tag, ZERO_OID, old_oid)], false).is_err(),
+        "M3 regression: disappearing witness authorized ref in same transaction!"
+    );
+
+    // M9: Wrapper `git fsck` propagates a signet-only failure (tampered remote tag) with non-zero exit code!
+    let m9_tag = format!("refs/tags/forged+{marker_a}");
+    assert!(env.git_with_env(&m3_dir, &["update-ref", &m9_tag, &old_oid_hex], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    assert!(env.git_with_env(&m3_dir, &["update-ref", "-d", &format!("refs/tags/witness+{marker_a}")], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let wrap_bad = Command::new(bin_dir.join("git"))
+        .current_dir(&m3_dir)
+        .env("HOME", &env.home)
+        .env("GIT_SIGNET_CONFIG_DIR", &env.config_dir)
+        .env("GIT_SIGNET_REAL_GIT", &env.real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["fsck"])
+        .output()
+        .unwrap();
+    assert!(!wrap_bad.status.success(), "M9 regression: wrapper git fsck swallowed signet verification failure!");
+}
+
+#[test]
+fn mutation_hardening_boundaries_and_parsers() {
+    let env = TestEnv::new("mut-hardening");
+    let dir = env.root.join("repo");
+    env.git_ok(&env.root, &["init", dir.to_str().unwrap()]);
+    let sid = SignetId::from_bytes(&[0x33u8; 32]);
+    let marker = format_signet_marker(&sid);
+    let dig_hex = "a".repeat(64);
+    let dig_hex2 = "b".repeat(64);
+
+    // id.rs: revision-walk operators rejected individually on signet-bound AND digest-pinned refs
+    for bad_ref in [
+        format!("refs/heads/main+{marker}^1"),
+        format!("refs/heads/main+{marker}~2"),
+        format!("refs/heads/a..b+{marker}"),
+        format!("refs/tags/v1+blake3-{dig_hex}^1"),
+        format!("refs/tags/v1+blake3-{dig_hex}~1"),
+        format!("refs/tags/v1..v2+blake3-{dig_hex}"),
+    ] {
+        assert!(extract_signet_from_refname(&bad_ref).is_err() || extract_blake3_pin_from_refname(&bad_ref).is_err());
+    }
+    assert!(extract_signet_from_refname(&format!("main+{marker}^1")).is_err());
+    assert!(extract_signet_from_refname(&format!("main+{marker}~1")).is_err());
+    assert!(extract_signet_from_refname(&format!("a..b+{marker}")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{dig_hex}^1")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{dig_hex}~1")).is_err());
+    assert!(extract_blake3_pin_from_refname(&format!("a..b+blake3-{dig_hex}")).is_err());
+
+    // id.rs: boundary matching, identical duplicate markers vs conflicting markers, trailing '+'
+    assert_eq!(extract_signet_from_refname(&format!("x{marker}")).unwrap(), None);
+    assert_eq!(extract_signet_from_refname(&format!("main+{marker}+{marker}")).unwrap(), Some(sid));
+    assert_eq!(extract_blake3_pin_from_refname(&format!("xblake3-{dig_hex}")).unwrap(), None);
+    assert_eq!(extract_blake3_pin_from_refname(&format!("v1+blake3-{dig_hex}+")).unwrap(), Some([0xaau8; 32]));
+    assert_eq!(extract_blake3_pin_from_refname(&format!("v1+blake3-{dig_hex}+blake3-{dig_hex}")).unwrap(), Some([0xaau8; 32]));
+    assert!(extract_blake3_pin_from_refname(&format!("v1+blake3-{dig_hex}+blake3-{dig_hex2}")).is_err());
+    assert!(extract_blake3_pin_from_refname("v1+blake3-notenoughhex").unwrap().is_none());
+
+    // id.rs: decode_imprint_armor length boundary (16384 vs 16385), <3 lines, bad header, bad footer
+    let over = vec![b'A'; 16_385];
+    let over_err = decode_imprint_armor(&over).unwrap_err();
+    assert!(over_err.contains("exceeds 16384"), "got: {over_err}");
+    let exact = vec![b'A'; 16_384];
+    let exact_err = decode_imprint_armor(&exact).unwrap_err();
+    assert!(exact_err.contains("SIGNED MESSAGE"), "exact 16384 must pass size guard, got: {exact_err}");
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\n-----END SIGNED MESSAGE-----\n").is_err());
+    assert!(decode_imprint_armor(b"-----BEGIN WRONG-----\nAAAA\n-----END SIGNED MESSAGE-----\n").is_err());
+    assert!(decode_imprint_armor(b"-----BEGIN SIGNED MESSAGE-----\nAAAA\n-----END WRONG-----\n").is_err());
+
+    // blake3_chain.rs: signet-parent without signet-tree error reason
+    let bad_hdr = format!(
+        "tree {}\nparent {}\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\nsignet-parent blake3 {}\n\nmsg\n",
+        to_hex(&[0x11u8; 20]),
+        to_hex(&[0x22u8; 20]),
+        dig_hex
+    );
+    let p_err = parse_commit(bad_hdr.into_bytes()).unwrap_err();
+    assert!(p_err.message.contains("without signet-tree"), "got: {}", p_err.message);
+
+    // blake3_chain.rs: insert_signet_headers strips multiline gpgsig, preserves trailing headers, handles no-body commit
+    let raw_with_sig =
+        format!("tree {}\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\ngpgsig line1\n line2\n line3\nencoding utf-8\n\nbody\n", to_hex(&[0x11u8; 20]));
+    let inserted = insert_signet_headers(raw_with_sig.as_bytes(), &[0x11u8; 20], &[0xaa; 32], &[]).unwrap();
+    let ins_str = String::from_utf8(inserted).unwrap();
+    assert!(!ins_str.contains("gpgsig") && !ins_str.contains("line2") && ins_str.contains("encoding utf-8") && ins_str.ends_with("\n\nbody\n"));
+    let no_body = format!("tree {}\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000", to_hex(&[0x11u8; 20]));
+    let ins_nb = insert_signet_headers(no_body.as_bytes(), &[0x11u8; 20], &[0xaa; 32], &[]).unwrap();
+    assert!(!ins_nb.windows(2).any(|w| w == b"\n\n"));
+
+    // blake3_chain.rs & snapshot.rs on a real repo with nested directories + multi-byte blob + plain-on-carrying + forged tag
+    fs::create_dir_all(dir.join("sub/deep")).unwrap();
+    fs::write(dir.join("sub/deep/data.bin"), b"0123456789abcdefghijklmnopqrstuvwxyz").unwrap();
+    fs::write(dir.join("top.txt"), b"top-content\n").unwrap();
+    env.git_ok(&dir, &["add", "."]);
+    env.git_ok(&dir, &["commit", "-m", "c1"]);
+    let c1_hex = env.git_ok(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // Carrying commit c2 on top of plain c1, then plain commit c3 on top of carrying c2
+    let bin_dir = env.root.join("bin");
+    env.signet_ok(&dir, &["enable", "--global", "--wrapper-dir", bin_dir.to_str().unwrap()]);
+    let out_k = env.signet_ok(&dir, &["keygen"]);
+    let marker_k = out_k.lines().find_map(|l| l.strip_prefix("Signet ID:")).unwrap().trim().to_owned();
+    let seed_path = env.config_dir.join("signets").join(format!("{marker_k}.seed"));
+    env.signet_ok(&dir, &["imprint-here", seed_path.to_str().unwrap()]);
+    fs::write(dir.join("top.txt"), b"v2\n").unwrap();
+    env.git_ok(&dir, &["add", "top.txt"]);
+    env.git_ok(&dir, &["commit", "-m", "c2 carrying"]);
+    let c2_hex = env.git_ok(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    fs::write(dir.join("top.txt"), b"v3\n").unwrap();
+    env.git_ok(&dir, &["add", "top.txt"]);
+    assert!(env.git_with_env(&dir, &["commit", "-m", "c3 plain"], &[("GIT_SIGNET_SKIP_HOOK", "1")]).status.success());
+    let c3_hex = env.git_ok(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    let mut repo = GitRepo::open(Some(&dir)).unwrap();
+    let ctx = ContextKeys::new();
+    let c1 = repo.rev_parse(&c1_hex).unwrap();
+    let c2 = repo.rev_parse(&c2_hex).unwrap();
+    let c3 = repo.rev_parse(&c3_hex).unwrap();
+
+    // Verify exact carrying_commits, plain_commits, non-zero tip_digest on plain-over-carrying, and tree reuse
+    let rep_c3 = verify_commit_chain(&mut repo, &ctx, &c3, None, false).unwrap();
+    assert_eq!(rep_c3.carrying_commits, 1);
+    assert_eq!(rep_c3.plain_commits, 2);
+    assert!(!rep_c3.tip_carries_lines);
+    assert!(!rep_c3.shallow_boundary_hit);
+    assert_ne!(rep_c3.digest, [0u8; 32]);
+    let mut tcache = DigestCache::memory_only();
+    let (_, c1_raw) = repo.read_object(&c1).unwrap();
+    let c1_tree = parse_commit(c1_raw.clone()).unwrap().tree;
+    let d1 = compute_tree_digest(&mut repo, &ctx, &c1_tree, &mut tcache).unwrap();
+    let d2 = compute_tree_digest(&mut repo, &ctx, &c1_tree, &mut tcache).unwrap();
+    assert_eq!(d1, d2);
+
+    // Forged annotated tag declaring `type commit` while pointing at a blob object
+    let blob_hex = env.git_ok(&dir, &["rev-parse", "HEAD:top.txt"]).trim().to_owned();
+    let forged_tag = format!("object {blob_hex}\ntype commit\ntag bad\ntagger A <a@a> 1 +0000\n\nbad\n");
+    let forged_tag_oid = repo.hash_object_write(ObjKind::Tag, forged_tag.as_bytes()).unwrap();
+    let peel_err = git_signet::blake3_chain::peel_to_commit(&mut repo, &forged_tag_oid).unwrap_err();
+    assert!(peel_err.message.contains("type mismatch"), "got: {}", peel_err.message);
+
+    // Shallow boundary flag: true on parented graft (c2), false on root graft (c1)
+    repo.shallow.insert(c2);
+    let rep_sh = verify_commit_chain(&mut repo, &ctx, &c2, None, true).unwrap();
+    assert!(rep_sh.shallow_boundary_hit);
+    repo.shallow.clear();
+    repo.shallow.insert(c1);
+    let rep_root_sh = verify_commit_chain(&mut repo, &ctx, &c1, None, true).unwrap();
+    assert!(!rep_root_sh.shallow_boundary_hit);
+    repo.shallow.clear();
+
+    // snapshot.rs: SnapshotReader::finish_or_reset resets cat-file --batch mid-blob AND right at need_blob_nl!
+    let mut full = Vec::new();
+    {
+        let mut r = SnapshotReader::for_commit(&mut repo, &c1_raw).unwrap();
+        r.read_to_end(&mut full).unwrap();
+        r.finish_or_reset();
+    }
+    // Find offset inside the 36-byte blob `0123456789abcdefghijklmnopqrstuvwxyz`
+    let needle = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let pos = full.windows(needle.len()).position(|w| w == needle).unwrap();
+    // 1) Stop mid-blob (blob_remaining > 0)
+    {
+        let mut r = SnapshotReader::for_commit(&mut repo, &c1_raw).unwrap();
+        let mut partial = vec![0u8; pos + 5];
+        r.read_exact(&mut partial).unwrap();
+        r.finish_or_reset();
+    }
+    assert_eq!(repo.read_object(&c1).unwrap().0, ObjKind::Commit);
+    // 2) Stop right after the last byte of the blob (blob_remaining == 0, need_blob_nl == true!)
+    {
+        let mut r = SnapshotReader::for_commit(&mut repo, &c1_raw).unwrap();
+        let mut exact_blob = vec![0u8; pos + needle.len()];
+        r.read_exact(&mut exact_blob).unwrap();
+        r.finish_or_reset();
+    }
+    // snapshot.rs: extract_tag_imprint edge cases (no body, empty message before armor, duplicate armor blocks)
+    assert!(matches!(extract_tag_imprint(b"object 0000\ntype commit\ntag t\n"), ExtractedArmor::Malformed(_)));
+    let empty_msg_tag = b"object 0000\ntype commit\ntag t\ntagger A <a@a> 1 +0000\n\n-----BEGIN SIGNED MESSAGE-----\nAAAA\n-----END SIGNED MESSAGE-----\n";
+    match extract_tag_imprint(empty_msg_tag) {
+        ExtractedArmor::Present { payload, armor } => {
+            assert!(payload.ends_with(b"\n\n"));
+            assert!(armor.starts_with(b"-----BEGIN SIGNED MESSAGE-----\n"));
+        }
+        other => panic!("expected Present, got {other:?}"),
+    }
+    let dup_tag = b"object 0000\ntype commit\ntag t\ntagger A <a@a> 1 +0000\n\nmsg\n-----BEGIN SIGNED MESSAGE-----\nA\n-----BEGIN SIGNED MESSAGE-----\nB\n";
+    assert!(matches!(extract_tag_imprint(dup_tag), ExtractedArmor::Malformed(_)));
 }

@@ -87,7 +87,7 @@ A commit carrying BLAKE3 headers includes, directly after the `committer` header
 - **Stale commit (`git commit --amend` artifact):** has exactly one `signet-tree` whose embedded tree OID differs from the commit's current `tree` OID (and zero malformed lines). Treated as plain during verification and replaced on `post-commit`.
 - **Malformed commit:** any duplicate `signet-tree`, mismatched `signet-parent` count/order, bad hex, or non-matching `signet-tree`/`signet-parent` digest is rejected.
 
-Verification always uses a fresh **memory-only** digest map; unauthenticated disk cache files (`.git/signet-cache.bin`) are never relied on during verification or imprinting.
+Verification and header emission always use a fresh **memory-only** digest map; no unauthenticated disk cache file is read or written.
 
 ---
 
@@ -130,18 +130,19 @@ Iterative depth-first traversal in Git's stored entry order (explicit stack, max
 For a ref update `R -> O`:
 1. In a non-bare repository, local `refs/heads/*` and `HEAD` are **never** governed by a signet (so local commits are never refused).
 2. A `blincs-<52>` in `R` governs `R` (for remote-tracking refs, tags, and bare-repo branches).
-3. A `blincs-<52>` in `remote.<name>.url` governs `refs/remotes/<name>/*`, tags arriving in the same fetch (or in a single-remote repo), and in a bare single-remote mirror its branches, tags, and `HEAD`.
-4. Conflicting signet IDs between `R` and the remote URL are rejected.
+3. A `blincs-<52>` in `remote.<name>.url` governs `refs/remotes/<name>/*`, tags arriving in a single-marked-remote fetch (or single-remote repo), and in a bare repository its own directory basename or single remote governs its branches, tags, and `HEAD`.
+4. Conflicting signet IDs between `R`, the remote URL, or a bare repository's own directory basename are rejected.
+5. Git `reference-transaction` records are parsed byte-for-byte on ASCII spaces (`0x20`) without splitting non-ASCII whitespace; malformed records and unauthorized symbolic ref updates fail closed, and the `prepared` hook is strictly read-only.
 
 ### 5.2 Formal authorization rule
 A ref update `R -> O` governed by signet ID `S` is **accepted** if and only if:
-1. Its BLAKE3 commit chain verifies cleanly (stopping at `.git/shallow` grafts only when shallow mode is permitted, and always verifying the tip's `signet-tree`), **and**
+1. Its full BLAKE3 commit chain verifies cleanly from `O` down to root commits or `.git/shallow` grafts (when shallow mode is permitted; prior ref values are never skipped as unauthenticated checkpoints), **and**
 2. One of the following holds:
-   - **(a) Direct commit imprint:** `O` is a commit (or tag peeling to a commit `C`) carrying a `BLINCSg2` imprint that verifies `CommitSnapshot(C)` under `S`; or
-   - **(b) Direct annotated-tag imprint:** `O` is an annotated tag carrying a `BLINCSg2` imprint that verifies `TagSnapshot(O)` under `S`; or
-   - **(c) Transitive ancestor closure:** `O` is a commit (or tag peeling to a commit `C`) that lies in the **BLAKE3-verified transitive ancestor closure** of a commit `T` whose direct imprint under `S` has been verified (either in the same transaction batch or on an existing governed ref of the repository).
+   - **(a) Direct commit imprint:** `O` is a commit (or unimprinted tag peeling to a commit `C`) carrying a `BLINCSg2` imprint that verifies `CommitSnapshot(C)` under `S`; or
+   - **(b) Direct annotated-tag imprint:** `O` is an annotated tag carrying a `BLINCSg2` imprint that verifies `TagSnapshot(O)` under `S` (authorizing that tag itself, never delegating closure authority to other refs); or
+   - **(c) Transitive ancestor closure:** `O` is a commit (or tag peeling to a commit `C`) that lies in the **BLAKE3-authenticated ancestor closure** (traversing only verified `signet-parent` edges) of a directly verified **carrying** commit `T` under `S` that survives in the projected post-transaction ref set (refs deleted or replaced in the same transaction cannot act as witnesses).
 
-Rule (c) lets repositories adopt `git-signet` without rewriting historical commits or old release tags: once a newer tip commit `T` carries `signet-parent` bindings reaching back to `C` and a valid BLINCS imprint under `S`, old tags pointing to `C` verify automatically, while any commit outside `T`'s verified ancestor closure is refused.
+Rule (c) lets repositories adopt `git-signet` without rewriting historical commits or old release tags: once a newer carrying tip commit `T` carries `signet-parent` bindings reaching back to `C` and a valid BLINCS imprint under `S`, old tags pointing to `C` verify automatically, while any commit outside `T`'s authenticated ancestor closure is refused. (A directly imprinted plain commit without `signet-parent` headers authorizes only itself, not its unauthenticated ancestors.)
 
 ---
 

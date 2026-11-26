@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 blake3-servil-core = "=0.11.0"
-signet = { git = "https://github.com/jasonhadler25/blincs", rev = "9c674f10d2d7b9c8b16161cbfad3a217fa4c9a7b" }
+signet = { git = "https://github.com/jasonhadler25/blincs", rev = "b8702e6067eb0dc4dad995a01305f1140c609d3e" }
 
 [profile.test]
 opt-level = 3

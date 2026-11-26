@@ -75,11 +75,12 @@ impl StoreError {
     }
 }
 
-/// Strip ASCII control characters (including ANSI escapes) before printing attacker-controlled strings.
+/// Strip ASCII/Unicode control and bidirectional formatting characters before printing untrusted strings.
 pub fn sanitize_for_tty(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch.is_control() {
+        let is_bidi = matches!(ch, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+        if ch.is_control() || is_bidi {
             out.push('?');
         } else {
             out.push(ch);
@@ -187,10 +188,17 @@ pub struct GitRepo {
 
 impl GitRepo {
     pub fn open(dir: Option<&Path>) -> Result<Self, String> {
+        Self::open_with_git_dir(dir, None)
+    }
+
+    pub fn open_with_git_dir(dir: Option<&Path>, explicit_git_dir: Option<&Path>) -> Result<Self, String> {
         let real_git = resolve_real_git()?;
         let mut cmd = Command::new(&real_git);
         if let Some(d) = dir {
             cmd.arg("-C").arg(d);
+        }
+        if let Some(gd) = explicit_git_dir {
+            cmd.arg("--git-dir").arg(gd);
         }
         cmd.arg("--no-replace-objects").env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_NO_LAZY_FETCH", "1").args([
             "rev-parse",
@@ -218,14 +226,15 @@ impl GitRepo {
 
         let mut shallow = HashSet::new();
         let shallow_file = common_dir.join("shallow");
-        if let Ok(raw) = fs::read_to_string(&shallow_file) {
+        if shallow_file.exists() {
+            let raw = fs::read_to_string(&shallow_file).map_err(|e| format!("read {}: {e}", shallow_file.display()))?;
             for line in raw.lines() {
                 let s = line.trim();
-                if s.len() == 40
-                    && let Ok(oid) = decode_lower_hex::<20>(s)
-                {
-                    shallow.insert(oid);
+                if s.is_empty() {
+                    continue;
                 }
+                let oid = decode_lower_hex::<20>(s).map_err(|e| format!("malformed entry in {}: {e}", shallow_file.display()))?;
+                shallow.insert(oid);
             }
         }
 
@@ -255,12 +264,19 @@ impl GitRepo {
         decode_lower_hex::<20>(s.trim()).map_err(|e| format!("bad oid for {rev:?}: {e}"))
     }
 
-    pub fn config_get(&self, key: &str) -> Option<String> {
-        let out = self.run_output(["config", "--get", "--", key]).ok()?;
-        if !out.status.success() {
-            return None;
+    pub fn config_get_checked(&self, key: &str) -> Result<Option<String>, String> {
+        let out = self.run_output(["config", "--get", "--", key])?;
+        if out.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()));
         }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        if out.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(format!("git config --get {key} failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+
+    pub fn config_get(&self, key: &str) -> Option<String> {
+        self.config_get_checked(key).ok().flatten()
     }
 
     pub fn config_get_bool(&self, key: &str) -> Option<bool> {
@@ -295,11 +311,11 @@ impl GitRepo {
     pub fn list_remotes(&self) -> Result<Vec<(String, String)>, String> {
         let out = self.run_output(["remote"])?;
         if !out.status.success() {
-            return Ok(Vec::new());
+            return Err(format!("git remote failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
         let mut res = Vec::new();
         for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some(url) = self.config_get(&format!("remote.{name}.url")) {
+            if let Some(url) = self.config_get_checked(&format!("remote.{name}.url"))? {
                 res.push((name.to_owned(), url));
             }
         }
@@ -307,7 +323,7 @@ impl GitRepo {
     }
 
     pub fn for_each_ref(&self, pattern: Option<&str>) -> Result<Vec<(String, Oid)>, String> {
-        let mut args: Vec<OsString> = vec!["for-each-ref".into(), "--format=%(refname) %(objectname)".into()];
+        let mut args: Vec<OsString> = vec!["for-each-ref".into(), "--format=%(objectname) %(refname)".into()];
         if let Some(p) = pattern {
             args.push(p.into());
         }
@@ -316,12 +332,17 @@ impl GitRepo {
             return Err(format!("git for-each-ref failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
         let mut refs = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some((r, hex)) = line.rsplit_once(' ')
-                && let Ok(oid) = decode_lower_hex::<20>(hex)
-            {
-                refs.push((r.to_owned(), oid));
+        for raw_line in out.stdout.split(|&b| b == b'\n') {
+            if raw_line.is_empty() {
+                continue;
             }
+            let Some(sp) = raw_line.iter().position(|&b| b == b' ') else {
+                return Err("malformed git for-each-ref output line".into());
+            };
+            let hex = std::str::from_utf8(&raw_line[..sp]).map_err(|_| "non-UTF-8 oid in for-each-ref".to_string())?;
+            let refname = std::str::from_utf8(&raw_line[sp + 1..]).map_err(|_| "non-UTF-8 refname in for-each-ref".to_string())?;
+            let oid = decode_lower_hex::<20>(hex)?;
+            refs.push((refname.to_owned(), oid));
         }
         Ok(refs)
     }
@@ -359,12 +380,8 @@ impl GitRepo {
             p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let mut line = String::new();
-            let n = p.stdout.read_line(&mut line).map_err(|e| StoreError::failed(format!("cat-file read: {e}")))?;
-            if n == 0 {
-                return Err(StoreError::failed("unexpected EOF from git cat-file --batch-check"));
-            }
-            parse_batch_header(line.trim_end_matches('\n'), oid)
+            let line = read_bounded_batch_line(&mut p.stdout)?;
+            parse_batch_header(&line, oid)
         })();
         if let Err(ref e) = res
             && e.kind == StoreErrorKind::Failed
@@ -374,7 +391,8 @@ impl GitRepo {
         res
     }
 
-    /// Read a complete metadata object (`Commit`, `Tree`, `Tag`, or small `Blob`) up to `MAX_METADATA_OBJECT_BYTES`.
+    /// Read a complete metadata object (`Commit`, `Tree`, `Tag`, or bounded small `Blob`),
+    /// checking `size <= MAX_METADATA_OBJECT_BYTES` BEFORE allocating!
     pub fn read_object(&mut self, oid: &Oid) -> Result<(ObjKind, Vec<u8>), StoreError> {
         let hex = to_hex(oid);
         let res = (|| -> Result<(ObjKind, Vec<u8>), StoreError> {
@@ -382,14 +400,10 @@ impl GitRepo {
             p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let mut line = String::new();
-            let n = p.stdout.read_line(&mut line).map_err(|e| StoreError::failed(format!("cat-file read: {e}")))?;
-            if n == 0 {
-                return Err(StoreError::failed("unexpected EOF from git cat-file --batch"));
-            }
-            let (kind, size) = parse_batch_header(line.trim_end_matches('\n'), oid)?;
+            let line = read_bounded_batch_line(&mut p.stdout)?;
+            let (kind, size) = parse_batch_header(&line, oid)?;
             let len = usize::try_from(size).map_err(|_| StoreError::failed("object size exceeds usize"))?;
-            if kind != ObjKind::Blob && len > MAX_METADATA_OBJECT_BYTES {
+            if len > MAX_METADATA_OBJECT_BYTES {
                 return Err(StoreError::failed(format!("{} object {} exceeds 64 MiB limit ({len} bytes)", kind.as_str(), to_hex(oid))));
             }
             let mut buf = vec![0u8; len];
@@ -418,12 +432,8 @@ impl GitRepo {
             p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
             p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let mut line = String::new();
-            let n = p.stdout.read_line(&mut line).map_err(|e| StoreError::failed(format!("cat-file read: {e}")))?;
-            if n == 0 {
-                return Err(StoreError::failed("unexpected EOF from git cat-file --batch"));
-            }
-            parse_batch_header(line.trim_end_matches('\n'), oid)
+            let line = read_bounded_batch_line(&mut p.stdout)?;
+            parse_batch_header(&line, oid)
         })();
         if let Err(ref e) = res
             && e.kind == StoreErrorKind::Failed
@@ -438,8 +448,25 @@ impl GitRepo {
     }
 }
 
+const MAX_BATCH_HEADER_BYTES: usize = 512;
+
+fn read_bounded_batch_line(stdout: &mut BufReader<ChildStdout>) -> Result<String, StoreError> {
+    let mut raw = Vec::with_capacity(64);
+    let mut limited = stdout.take(u64::try_from(MAX_BATCH_HEADER_BYTES + 1).unwrap());
+    let n = limited.read_until(b'\n', &mut raw).map_err(|e| StoreError::failed(format!("cat-file read: {e}")))?;
+    if n == 0 {
+        return Err(StoreError::failed("unexpected EOF from git cat-file --batch"));
+    }
+    if raw.len() > MAX_BATCH_HEADER_BYTES || !raw.ends_with(b"\n") {
+        return Err(StoreError::failed("cat-file header missing LF or exceeds 512 bytes"));
+    }
+    raw.pop();
+    String::from_utf8(raw).map_err(|_| StoreError::failed("non-UTF-8 cat-file header"))
+}
+
 fn parse_batch_header(header: &str, oid: &Oid) -> Result<(ObjKind, u64), StoreError> {
-    if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+    let hex = to_hex(oid);
+    if header == format!("{hex} missing") || header == format!("{hex} ambiguous") {
         return Err(StoreError::missing(oid));
     }
     let parts: Vec<&str> = header.split(' ').collect();
@@ -448,7 +475,7 @@ fn parse_batch_header(header: &str, oid: &Oid) -> Result<(ObjKind, u64), StoreEr
     }
     let got_oid = decode_lower_hex::<20>(parts[0]).map_err(|e| StoreError::failed(format!("bad cat-file oid: {e}")))?;
     if got_oid != *oid {
-        return Err(StoreError::failed(format!("cat-file oid mismatch: expected {}, got {}", to_hex(oid), parts[0])));
+        return Err(StoreError::failed(format!("cat-file oid mismatch: expected {hex}, got {}", parts[0])));
     }
     let kind = ObjKind::from_bytes(parts[1].as_bytes()).map_err(StoreError::failed)?;
     let size = parts[2].parse::<u64>().map_err(|e| StoreError::failed(format!("bad cat-file size: {e}")))?;
@@ -497,24 +524,32 @@ pub fn parse_git_tree(raw: &[u8]) -> Result<Vec<TreeEntry>, String> {
     Ok(entries)
 }
 
-/// Parse the `tree <40-hex>` and `parent <40-hex>` headers of a raw Git commit.
+/// Parse the canonical `tree <40-hex>` (first header line) and contiguous `parent <40-hex>`
+/// headers of a raw Git commit. Rejects duplicate `tree` lines or out-of-order `parent` lines.
 pub fn parse_commit_tree_and_parents(raw: &[u8]) -> Result<(Oid, Vec<Oid>), String> {
     let header_end = raw.windows(2).position(|w| w == b"\n\n").unwrap_or(raw.len());
-    let mut tree: Option<Oid> = None;
+    let mut lines = raw[..header_end].split(|&b| b == b'\n');
+    let first = lines.next().ok_or_else(|| "empty commit header".to_string())?;
+    let tree_rest = first.strip_prefix(b"tree ").ok_or_else(|| "commit must begin with tree header".to_string())?;
+    let tree_s = std::str::from_utf8(tree_rest).map_err(|_| "non-UTF-8 tree oid".to_string())?;
+    let tree = decode_lower_hex::<20>(tree_s)?;
+
     let mut parents = Vec::new();
-    for line in raw[..header_end].split(|&b| b == b'\n') {
-        if let Some(rest) = line.strip_prefix(b"tree ") {
-            if tree.is_some() {
-                return Err("commit has duplicate tree headers".into());
+    let mut parents_done = false;
+    for line in lines {
+        if line.starts_with(b"tree ") {
+            return Err("commit has duplicate tree headers".into());
+        }
+        if let Some(rest) = line.strip_prefix(b"parent ") {
+            if parents_done {
+                return Err("commit has non-contiguous parent header".into());
             }
-            let s = std::str::from_utf8(rest).map_err(|_| "non-UTF-8 tree oid".to_string())?;
-            tree = Some(decode_lower_hex::<20>(s)?);
-        } else if let Some(rest) = line.strip_prefix(b"parent ") {
             let s = std::str::from_utf8(rest).map_err(|_| "non-UTF-8 parent oid".to_string())?;
             parents.push(decode_lower_hex::<20>(s)?);
+        } else {
+            parents_done = true;
         }
     }
-    let tree = tree.ok_or_else(|| "commit missing tree header".to_string())?;
     Ok((tree, parents))
 }
 

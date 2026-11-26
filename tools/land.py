@@ -30,6 +30,8 @@ def main():
             print(st, file=sys.stderr)
             sys.exit(1)
 
+    run(["cargo", "fetch", "--locked"], "cargo fetch")
+    run([sys.executable, "tools/cargo_lock_hashsets.py"], "Cargo.lock hashsets (BLAKE3 + SHA-256)")
     run(["cargo", "fmt", "--", "--check"], "rustfmt check")
     run([sys.executable, "tools/counts.py"], "shipped safety counts")
     run(["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], "clippy (-D warnings)")

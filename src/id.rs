@@ -301,8 +301,13 @@ pub fn encode_imprint_armor(id: &SignetId, imprint: &Imprint) -> Vec<u8> {
     out
 }
 
+const MAX_ARMOR_BYTES: usize = 16_384;
+
 /// Strictly decode `BLINCSg2` PEM armor into `(SignetId, Imprint)`.
 pub fn decode_imprint_armor(armor: &[u8]) -> Result<(SignetId, Imprint), String> {
+    if armor.len() > MAX_ARMOR_BYTES {
+        return Err(format!("imprint armor exceeds {MAX_ARMOR_BYTES} bytes"));
+    }
     let trimmed = armor.strip_suffix(b"\n").unwrap_or(armor);
     let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
     let lines: Vec<&[u8]> = trimmed.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).collect();

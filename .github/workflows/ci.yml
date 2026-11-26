@@ -44,5 +44,5 @@ jobs:
           rm /tmp/nextest.tar.gz
           cargo nextest --version
 
-      - name: Format, counts, clippy, nextest, doctests, and planted-fault controls
+      - name: Fetch crates, verify Cargo.lock hashsets (BLAKE3 + SHA-256), format, counts, clippy, rustdoc, nextest, doctests, and planted-fault controls
         run: python3 tools/land.py --skip-clean-check
