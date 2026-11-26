@@ -88,7 +88,7 @@ Because Maya had `git-signet` enabled when she created `9f3c1a2`:
    Git aborts the clone before writing a single file to Sam's working tree.
 
 2. **On Sam's existing clone or CI cache:** If a compromised server later serves a poisoned object during `git fetch`/`git pull` or `git fsck`, Sam's verified `signet-tree` and `signet-parent` headers catch it immediately.
-3. **Sorting clean backups from poisoned mirrors:** Maya has five mirrors and laptops all reporting `HEAD = 9f3c1a2`. Running `git signet check HEAD --no-shallow` (or `git fsck` with the optional wrapper) immediately separates clean copies (`MATCH`) from poisoned twins.
+3. **Sorting clean backups from poisoned mirrors:** Maya has five mirrors and laptops all reporting `HEAD = 9f3c1a2`. Running `git signet check HEAD --no-shallow` (or `git fsck && git signet fsck`) immediately separates clean copies (`MATCH`) from poisoned twins.
 
 ---
 
@@ -118,7 +118,7 @@ To stock Git and Cargo it is an ordinary tag name. To any machine running `git-s
 
 Layer 1 and Layer 2 protect against hash breaks, but anyone who compromises the Git forge or steals a maintainer's forge token can still push a new commit with valid BLAKE3 headers.
 
-When Maya also wants `git clone`, `git fetch`, and `git pull` to reject unauthorized commits automatically — with **no GPG, no certificate authority, no keyservers, and no `allowed_signers` file**, powered by [Signet](https://github.com/jasonhadler25/blincs) (an implementation of BLINCS, a stateless hash-based signature scheme based on BLAKE3 and SPHINCS) — she can opt into a **signet-bound name**.
+When Maya also wants `git clone`, `git fetch`, and `git pull` to reject unauthorized commits automatically — with **no GPG, no certificate authority, no keyservers, and no `allowed_signers` file**, powered by [Signet](https://github.com/jasonhadler25/signet) (an implementation of BLINCS, a stateless hash-based signature scheme based on BLAKE3 and SPHINCS) — she can opt into a **signet-bound name**.
 
 In cryptography, these objects are commonly called a private signing key, a verifying key, and a signature. Here we call them a **`Signet`**, a **`SignetId`**, and an **`Imprint`**, because a `Signet` is a bearer capability — anyone who holds it can exercise its authority — while a `SignetId` names which signet you mean and verifies its imprints. We borrow this terminology from object-capability security because it makes authority boundaries easier to reason about; if you prefer the conventional names, the mapping is exact.
 
@@ -142,7 +142,7 @@ git clone -b main+blincs-74nfu4k2ulfcryjbwknkyjbdbd7tlna3gfwm3fiomrr5e2t4pswa ht
 
 From then on:
 - **Zero per-repo setup for Maya:** wherever a repository URL or branch name carries a signet ID she has adopted, plain `git commit`, `git merge`, and `git rebase` automatically imprint with that signet (and elsewhere nothing changes).
-- **Salted whole-snapshot imprinting:** every BLINCS imprint streams the commit metadata plus every mode, filename, gitlink, and raw file byte of the entire tree directly into `signet::Signet::imprint_reader` under a bounded domain-separation `Context` with a fresh per-imprint random salt (strictly single-threaded via `blake3-servil-core`, ~1.3 ms for typical repositories). Even a hypothetical unsalted collision break of SHA-1 or BLAKE3 cannot swap a file under an existing imprint, and even a shallow clone (`git clone --depth=1`) verifies the entire checked-out snapshot.
+- **Salted whole-snapshot imprinting:** every BLINCS imprint pushes the commit metadata plus every mode, filename, gitlink, and raw file byte of the entire tree directly into `signet::Signet::imprint_with` under a bounded domain-separation `Context` with a fresh per-imprint random salt (strictly single-threaded via `blake3-servil-core`, ~1.3 ms for typical repositories). Even a hypothetical unsalted collision break of SHA-1 or BLAKE3 cannot swap a file under an existing imprint, and even a shallow clone (`git clone --depth=1`) verifies the entire checked-out snapshot.
 - **Native stock-Git verification:** imprints live in Git's standard `gpgsig` header (`gpg.format = x509`, `BLINCSg2` armor), so `git verify-commit HEAD`, `git verify-tag`, and `git log --show-signature` verify snapshot consistency natively (reporting `%G? = U` because stock Git does not enforce an external `SignetId` pin or BLAKE3 history; use `git signet check` or `git signet fsck` for full policy enforcement).
 - **No history rewriting for existing repos:** when Maya adopts a signet on an existing repository, old unimprinted commits and historical tags like `v2.4.0` keep working automatically via the **formal transitive-closure rule**: once a newer carrying tip commit `T` is directly verified under Maya's `SignetId` (and survives in the repository's refs), any ancestor commit `C` bound by `T`'s BLAKE3-verified `signet-parent` chain is accepted too — while any rogue commit or tag outside `T`'s authenticated ancestry is refused before a single ref moves. (Transitive closure authorizes the target commit only, not unsigned annotated-tag metadata.)
 - **Contributors are never blocked locally:** your own local commits on `refs/heads/*` and `HEAD` in a non-bare working repository are never refused, with or without the signet.
@@ -170,23 +170,17 @@ cargo install --path .
 git signet enable --global
 ```
 
-Optional transparent `git` wrapper (install into a directory first on `PATH` so plain `git fsck` also runs `git-signet fsck`):
-
-```sh
-git signet enable --global --wrapper-dir ~/.local/bin
-```
-
 ### Command reference
 
-- `git signet enable [--global | --local] [--wrapper-dir <dir>]` — configure native Git 2.56+ `[hook]` entries (`post-commit`, `post-merge`, `post-rewrite`, `reference-transaction`), `gpg.x509.program` (if unset), and optional `git` wrapper.
-- `git signet disable [--global | --local] [--wrapper-dir <dir>]` — cleanly remove hooks, `gpg.x509.program` (if set to `git-signet`), and optional wrapper.
-- `git signet keygen [--file <path>]` — generate a new BLINCS signet seed (`0600`) and adopt it.
+- `git signet enable [--global | --local]` — configure native Git 2.56+ `[hook]` entries (`post-commit`, `post-merge`, `post-rewrite`, `reference-transaction`) and `gpg.x509.program` (if not already set).
+- `git signet disable [--global | --local]` — cleanly remove hooks and `gpg.x509.program` (if set to `git-signet`).
+- `git signet keygen [--file <path>]` — generate a new BLINCS signet seed (`0600`) via `Signet::generate` and adopt it.
 - `git signet adopt <seed-file>` / `unadopt <seed-file>` — manage automatic imprinting for names carrying that signet ID.
 - `git signet format-id <seed-file>` — print a signet's canonical `blincs-<52>` ID.
 - `git signet imprint-here <seed-file>` — imprint every commit in the current repository even without a signet-bound name.
 - `git signet id [<rev>]` — print a commit's 64-hex BLAKE3 digest.
 - `git signet check [<rev>] [--signet blincs-<52>] [--expect <64-hex>] [--no-shallow]` — verify BLAKE3 history, optional digest pin, and BLINCS authorization.
-- `git signet fsck` — verify all refs in the repository.
+- `git signet fsck` — verify all refs in the repository (run alongside stock `git fsck`: `git fsck && git signet fsck`).
 
 ---
 

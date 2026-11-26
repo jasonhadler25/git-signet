@@ -54,26 +54,26 @@ CONTROLS = [
     (
         "allow_conflicting_signets",
         "src/id.rs",
-        'return Err(format!("conflicting blincs signet IDs in refname {refname:?}"));',
-        "let _ = (prev, id);",
+        "        (Some(x), Some(y)) if x != y => Err(on_conflict(&x, &y)),",
+        "        (Some(x), Some(_)) => Ok(Some(x)),",
     ),
     (
         "disable_no_shallow_enforcement",
         "src/blake3_chain.rs",
-        "let grafts: HashSet<Oid> = if allow_shallow { repo.shallow.clone() } else { HashSet::new() };",
-        "let grafts: HashSet<Oid> = if true || allow_shallow { repo.shallow.clone() } else { HashSet::new() };",
+        "        let is_graft = allow_shallow && repo.shallow.contains(&oid);",
+        "        let is_graft = repo.shallow.contains(&oid);",
     ),
     (
         "drop_snapshot_context",
         "src/snapshot.rs",
-        "match embedded_id.verify_reader(ctx, &mut reader, &imprint) {",
-        "match embedded_id.verify_reader(Context::EMPTY, &mut reader, &imprint) {",
+        "    match embedded_id.verify_with(ctx, imprint, |sink| write_payload_snapshot(repo, kind, payload, sink)) {",
+        "    match embedded_id.verify_with(Context::EMPTY, imprint, |sink| write_payload_snapshot(repo, kind, payload, sink)) {",
     ),
     (
         "c1_skip_verify_before_reimprint",
         "src/hooks.rs",
-        'verify_payload_imprint(repo, ObjKind::Commit, &orig_payload, &armor, Some(&embedded_id))\n                    .map_err(|e| format!("refusing to re-imprint commit with unverified BLINCS imprint: {e}"))?;',
-        "let _ = &orig_payload;",
+        '                verify_decoded_imprint(repo, ObjKind::Commit, &orig_payload, &embedded_id, &imprint, None)\n                    .map_err(|e| format!("refusing to re-imprint commit with unverified BLINCS imprint: {e}"))?;',
+        "                let _ = (&orig_payload, &imprint);",
     ),
     (
         "c2_ignore_malformed_ref_tx_line",
@@ -90,14 +90,14 @@ CONTROLS = [
     (
         "h5_allow_conflicting_expect_pin",
         "src/hooks.rs",
-        '(Some(a), Some(b)) if a != b => {\n            return Err(format!("conflicting BLAKE3 expectations: refname pins {}, --expect requests {}", to_hex(&a), to_hex(&b)));\n        }',
-        "(Some(_), Some(b)) => Some(b),",
+        '    let want_dig = agree(pin_dig, expected_digest.copied(), |a, b| {\n        format!("conflicting BLAKE3 expectations: refname pins {}, --expect requests {}", to_hex(a), to_hex(b))\n    })?;',
+        "    let want_dig = expected_digest.copied().or(pin_dig);",
     ),
     (
         "h5_skip_expected_signet_id_match",
         "src/snapshot.rs",
-        "if let Some(exp) = expected_id\n        && embedded_id != *exp\n    {",
-        "if false && let Some(exp) = expected_id && embedded_id != *exp {",
+        "    if let Some(exp) = expected_id\n        && embedded_id != exp\n    {",
+        "    if false && let Some(exp) = expected_id && embedded_id != exp {",
     ),
 ]
 

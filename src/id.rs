@@ -105,6 +105,62 @@ pub fn decode_lower_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
+/// Combine two independent expectations: absent + present = present; equal values agree;
+/// two distinct present values fail with `on_conflict(&a, &b)`.
+pub fn agree<T: Eq>(a: Option<T>, b: Option<T>, on_conflict: impl FnOnce(&T, &T) -> String) -> Result<Option<T>, String> {
+    match (a, b) {
+        (Some(x), Some(y)) if x != y => Err(on_conflict(&x, &y)),
+        (Some(x), _) => Ok(Some(x)),
+        (None, y) => Ok(y),
+    }
+}
+
+fn check_no_walk_ops(refname: &str, kind: &str) -> Result<(), String> {
+    if refname.contains('^') || refname.contains('~') || refname.contains("..") {
+        return Err(format!("ambiguous revision walk operator on {kind} ref {refname:?}"));
+    }
+    Ok(())
+}
+
+/// Split `seg` on `delims` and parse every token starting with `prefix`, enforcing agreement.
+fn scan_prefixed_tokens<T: Eq>(
+    seg: &str,
+    delims: &[char],
+    prefix: &str,
+    parse: impl Fn(&str, &str) -> Result<Option<T>, String>,
+    conflict_label: &str,
+) -> Result<Option<T>, String> {
+    let mut found: Option<T> = None;
+    for token in seg.split(delims) {
+        if let Some(payload) = token.strip_prefix(prefix)
+            && let Some(val) = parse(token, payload)?
+        {
+            found = agree(found, Some(val), |_, _| format!("conflicting {conflict_label} in {seg:?}"))?;
+        }
+    }
+    Ok(found)
+}
+
+fn parse_signet_payload(token: &str, payload: &str) -> Result<Option<SignetId>, String> {
+    if payload.len() == SIGNET_B32_LEN && payload.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
+        return Ok(Some(decode_signet_b32(payload)?));
+    }
+    if payload.len() >= 40 || payload.contains(['~', '^', '@', ':']) {
+        return Err(format!("malformed blincs signet ID token {token:?}"));
+    }
+    Ok(None)
+}
+
+fn parse_blake3_payload(token: &str, payload: &str) -> Result<Option<[u8; 32]>, String> {
+    if payload.len() == BLAKE3_HEX_LEN && payload.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(Some(decode_lower_hex::<32>(payload)?));
+    }
+    if payload.len() >= 40 || payload.contains(['~', '^', '@', ':']) {
+        return Err(format!("malformed blake3 digest pin token {token:?}"));
+    }
+    Ok(None)
+}
+
 /// Extract an optional `blincs-<52-base32>` `SignetId` from a Git ref name.
 ///
 /// Recognized delimiters: start of segment, `.`, or `+`. Fails closed on damaged 40+-char tokens,
@@ -112,22 +168,16 @@ pub fn decode_lower_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
 pub fn extract_signet_from_refname(refname: &str) -> Result<Option<SignetId>, String> {
     let mut found: Option<SignetId> = None;
     for seg in refname.split('/') {
-        if let Some(id) = extract_signet_from_segment(seg, true)? {
-            if let Some(prev) = found
-                && prev != id
-            {
-                return Err(format!("conflicting blincs signet IDs in refname {refname:?}"));
-            }
-            found = Some(id);
-        }
+        let seg_id = scan_prefixed_tokens(seg, &['.', '+'], SIGNET_PREFIX, parse_signet_payload, "blincs signet IDs")?;
+        found = agree(found, seg_id, |_, _| format!("conflicting blincs signet IDs in refname {refname:?}"))?;
     }
-    if found.is_some() && (refname.contains('^') || refname.contains('~') || refname.contains("..")) {
-        return Err(format!("ambiguous revision walk operator on signet-bound ref {refname:?}"));
+    if found.is_some() {
+        check_no_walk_ops(refname, "signet-bound")?;
     }
     Ok(found)
 }
 
-/// Extract an optional `blincs-<52-base32>` `SignetId` from a Git remote URL (basename only).
+/// Extract an optional `blincs-<52-base32>` `SignetId` from a Git remote URL (basename only; `.` delimiter, not `+`).
 pub fn extract_signet_from_remote_url(url: &str) -> Result<Option<SignetId>, String> {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -140,78 +190,18 @@ pub fn extract_signet_from_remote_url(url: &str) -> Result<Option<SignetId>, Str
     if repo_name.is_empty() {
         return Ok(None);
     }
-    extract_signet_from_segment(repo_name, false)
-}
-
-fn extract_signet_from_segment(seg: &str, allow_plus: bool) -> Result<Option<SignetId>, String> {
-    let bytes = seg.as_bytes();
-    let mut found: Option<SignetId> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let at_boundary = i == 0 || bytes[i - 1] == b'.' || (allow_plus && bytes[i - 1] == b'+');
-        if at_boundary && seg[i..].starts_with(SIGNET_PREFIX) {
-            let after = i + SIGNET_PREFIX.len();
-            let mut end = after;
-            while end < bytes.len() && bytes[end] != b'.' && !(allow_plus && bytes[end] == b'+') {
-                end += 1;
-            }
-            let payload = &seg[after..end];
-            if payload.len() == SIGNET_B32_LEN && payload.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
-                let id = decode_signet_b32(payload)?;
-                if let Some(prev) = found
-                    && prev != id
-                {
-                    return Err(format!("conflicting blincs signet IDs in {seg:?}"));
-                }
-                found = Some(id);
-                i = end;
-                continue;
-            }
-            // Reject likely damaged/mangled signet IDs (>= 40 chars or carrying walk operators after prefix).
-            if payload.len() >= 40 || payload.contains(['~', '^', '@', ':']) {
-                return Err(format!("malformed blincs signet ID token {:?} in {seg:?}", &seg[i..end]));
-            }
-        }
-        i += 1;
-    }
-    Ok(found)
+    scan_prefixed_tokens(repo_name, &['.'], SIGNET_PREFIX, parse_signet_payload, "blincs signet IDs")
 }
 
 /// Extract an optional `+blake3-<64-hex>` immutable commit digest pin from a ref name.
 pub fn extract_blake3_pin_from_refname(refname: &str) -> Result<Option<[u8; 32]>, String> {
     let mut found: Option<[u8; 32]> = None;
     for seg in refname.split('/') {
-        let bytes = seg.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let at_boundary = i == 0 || bytes[i - 1] == b'+' || bytes[i - 1] == b'.';
-            if at_boundary && seg[i..].starts_with(BLAKE3_PREFIX) {
-                let after = i + BLAKE3_PREFIX.len();
-                let mut end = after;
-                while end < bytes.len() && bytes[end] != b'+' && bytes[end] != b'.' {
-                    end += 1;
-                }
-                let payload = &seg[after..end];
-                if payload.len() == BLAKE3_HEX_LEN && payload.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    let dig = decode_lower_hex::<32>(payload)?;
-                    if let Some(prev) = found
-                        && prev != dig
-                    {
-                        return Err(format!("conflicting blake3 digest pins in refname {refname:?}"));
-                    }
-                    found = Some(dig);
-                    i = end;
-                    continue;
-                }
-                if payload.len() >= 40 || payload.contains(['~', '^', '@', ':']) {
-                    return Err(format!("malformed blake3 digest pin {:?} in {refname:?}", &seg[i..end]));
-                }
-            }
-            i += 1;
-        }
+        let seg_dig = scan_prefixed_tokens(seg, &['.', '+'], BLAKE3_PREFIX, parse_blake3_payload, "blake3 digest pins")?;
+        found = agree(found, seg_dig, |_, _| format!("conflicting blake3 digest pins in refname {refname:?}"))?;
     }
-    if found.is_some() && (refname.contains('^') || refname.contains('~') || refname.contains("..")) {
-        return Err(format!("ambiguous revision walk operator on digest-bound ref {refname:?}"));
+    if found.is_some() {
+        check_no_walk_ops(refname, "digest-bound")?;
     }
     Ok(found)
 }

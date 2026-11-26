@@ -1,12 +1,13 @@
-//! Hardened Git subprocess & `git cat-file --batch` object-store interface.
+//! Hardened Git subprocess & single `git cat-file --batch-command` object-store interface.
 //!
 //! Security boundaries:
-//! - Locates the real stock `git` binary, skipping our transparent wrapper script.
 //! - Rejects non-SHA-1 repositories (`extensions.objectFormat != sha1`).
 //! - Passes `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1`, and `GIT_NO_LAZY_FETCH=1`
 //!   on every Git invocation so replacement refs or lazy promisor fetches cannot hijack reads.
-//! - Resets persistent batch processes on any framing/I/O error so streams never desynchronize.
-//! - Enforces `MAX_METADATA_OBJECT_BYTES` (64 MiB) on commit/tree/tag objects while streaming blobs.
+//! - Owns `cat-file --batch-command` response framing completely (exact body bytes + trailing LF),
+//!   automatically resetting and reaping the child process if any read or streaming closure exits
+//!   early or encounters an error.
+//! - Enforces `MAX_METADATA_OBJECT_BYTES` (64 MiB) before allocating object buffers.
 
 use crate::id::{decode_lower_hex, to_hex};
 use std::collections::HashSet;
@@ -22,7 +23,7 @@ pub type Dig = [u8; 32];
 
 pub const ZERO_OID: Oid = [0u8; 20];
 pub const MAX_METADATA_OBJECT_BYTES: usize = 64 << 20;
-pub const WRAPPER_MARKER: &[u8] = b"# git-signet transparent git wrapper";
+pub const MAX_TREE_DEPTH: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjKind {
@@ -89,29 +90,29 @@ pub fn sanitize_for_tty(s: &str) -> String {
     out
 }
 
-/// Locate the real stock `git` executable on the system, skipping any `git-signet` (or legacy) wrapper.
+/// Locate the stock `git` executable (`GIT_SIGNET_REAL_GIT`, `PATH`, or standard system paths).
 pub fn resolve_real_git() -> Result<PathBuf, String> {
     if let Ok(explicit) = env::var("GIT_SIGNET_REAL_GIT") {
         let p = PathBuf::from(&explicit);
-        if is_executable_file(&p) && !is_wrapper_script(&p) {
+        if is_executable_file(&p) {
             return Ok(fs::canonicalize(&p).unwrap_or(p));
         }
     }
     if let Some(path_os) = env::var_os("PATH") {
         for dir in env::split_paths(&path_os) {
             let candidate = dir.join("git");
-            if is_executable_file(&candidate) && !is_wrapper_script(&candidate) {
+            if is_executable_file(&candidate) {
                 return Ok(fs::canonicalize(&candidate).unwrap_or(candidate));
             }
         }
     }
     for fallback in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
         let p = PathBuf::from(fallback);
-        if is_executable_file(&p) && !is_wrapper_script(&p) {
+        if is_executable_file(&p) {
             return Ok(fs::canonicalize(&p).unwrap_or(p));
         }
     }
-    Err("could not locate real `git` executable on PATH".into())
+    Err("could not locate `git` executable on PATH".into())
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -132,41 +133,48 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-pub fn is_wrapper_script(path: &Path) -> bool {
-    let Ok(mut f) = fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 256];
-    let Ok(n) = f.read(&mut head) else {
-        return false;
-    };
-    head[..n].windows(WRAPPER_MARKER.len()).any(|w| w == WRAPPER_MARKER)
-        || head[..n].windows(b"# git-buttress transparent git wrapper".len()).any(|w| w == b"# git-buttress transparent git wrapper")
-}
-
-pub(crate) struct BatchProc {
+struct BatchProc {
     child: Child,
-    pub(crate) stdin: BufWriter<ChildStdin>,
-    pub(crate) stdout: BufReader<ChildStdout>,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
 }
 
 impl BatchProc {
-    fn spawn(real_git: &Path, git_dir: &Path, check_only: bool) -> Result<Self, StoreError> {
+    fn spawn(real_git: &Path, git_dir: &Path) -> Result<Self, StoreError> {
         let mut cmd = Command::new(real_git);
         cmd.arg("--no-replace-objects")
             .arg("--git-dir")
             .arg(git_dir)
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_NO_LAZY_FETCH", "1")
-            .arg("cat-file")
-            .arg(if check_only { "--batch-check" } else { "--batch" })
+            .args(["cat-file", "--batch-command"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(|e| StoreError::failed(format!("spawn git cat-file: {e}")))?;
+        let mut child = cmd.spawn().map_err(|e| StoreError::failed(format!("spawn git cat-file --batch-command: {e}")))?;
         let stdin = BufWriter::new(child.stdin.take().ok_or_else(|| StoreError::failed("no cat-file stdin"))?);
         let stdout = BufReader::with_capacity(64 * 1024, child.stdout.take().ok_or_else(|| StoreError::failed("no cat-file stdout"))?);
         Ok(Self { child, stdin, stdout })
+    }
+
+    fn send_cmd(&mut self, verb: &str, oid: &Oid) -> Result<(ObjKind, u64), StoreError> {
+        let hex = to_hex(oid);
+        self.stdin.write_all(verb.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
+        self.stdin.write_all(b" ").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
+        self.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
+        self.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
+        self.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
+        let line = read_bounded_batch_line(&mut self.stdout)?;
+        parse_batch_header(&line, oid)
+    }
+
+    fn read_trailing_lf(&mut self) -> Result<(), StoreError> {
+        let mut nl = [0u8; 1];
+        self.stdout.read_exact(&mut nl).map_err(|e| StoreError::failed(format!("cat-file trailing newline: {e}")))?;
+        if nl[0] != b'\n' {
+            return Err(StoreError::failed("cat-file framing error: expected trailing newline"));
+        }
+        Ok(())
     }
 
     fn shutdown(mut self) {
@@ -183,22 +191,14 @@ pub struct GitRepo {
     pub is_bare: bool,
     pub shallow: HashSet<Oid>,
     batch: Option<BatchProc>,
-    batch_check: Option<BatchProc>,
 }
 
 impl GitRepo {
     pub fn open(dir: Option<&Path>) -> Result<Self, String> {
-        Self::open_with_git_dir(dir, None)
-    }
-
-    pub fn open_with_git_dir(dir: Option<&Path>, explicit_git_dir: Option<&Path>) -> Result<Self, String> {
         let real_git = resolve_real_git()?;
         let mut cmd = Command::new(&real_git);
         if let Some(d) = dir {
             cmd.arg("-C").arg(d);
-        }
-        if let Some(gd) = explicit_git_dir {
-            cmd.arg("--git-dir").arg(gd);
         }
         cmd.arg("--no-replace-objects").env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_NO_LAZY_FETCH", "1").args([
             "rev-parse",
@@ -238,7 +238,7 @@ impl GitRepo {
             }
         }
 
-        Ok(Self { real_git, git_dir, common_dir, is_bare, shallow, batch: None, batch_check: None })
+        Ok(Self { real_git, git_dir, common_dir, is_bare, shallow, batch: None })
     }
 
     pub fn cmd(&self) -> Command {
@@ -277,18 +277,6 @@ impl GitRepo {
 
     pub fn config_get(&self, key: &str) -> Option<String> {
         self.config_get_checked(key).ok().flatten()
-    }
-
-    pub fn config_get_bool(&self, key: &str) -> Option<bool> {
-        let out = self.run_output(["config", "--type=bool", "--get", "--", key]).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        match String::from_utf8_lossy(&out.stdout).trim() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        }
     }
 
     pub fn hash_object_write(&self, kind: ObjKind, bytes: &[u8]) -> Result<Oid, String> {
@@ -347,104 +335,117 @@ impl GitRepo {
         Ok(refs)
     }
 
-    pub(crate) fn reset_batch(&mut self) {
-        if let Some(p) = self.batch.take() {
-            p.shutdown();
+    fn take_batch(&mut self) -> Result<BatchProc, StoreError> {
+        match self.batch.take() {
+            Some(p) => Ok(p),
+            None => BatchProc::spawn(&self.real_git, &self.git_dir),
         }
     }
 
-    fn reset_batch_check(&mut self) {
-        if let Some(p) = self.batch_check.take() {
-            p.shutdown();
-        }
-    }
-
-    fn ensure_batch(&mut self) -> Result<&mut BatchProc, StoreError> {
-        if self.batch.is_none() {
-            self.batch = Some(BatchProc::spawn(&self.real_git, &self.git_dir, false)?);
-        }
-        Ok(self.batch.as_mut().unwrap())
-    }
-
-    fn ensure_batch_check(&mut self) -> Result<&mut BatchProc, StoreError> {
-        if self.batch_check.is_none() {
-            self.batch_check = Some(BatchProc::spawn(&self.real_git, &self.git_dir, true)?);
-        }
-        Ok(self.batch_check.as_mut().unwrap())
-    }
-
+    /// Query `(ObjKind, byte_len)` for `oid` via `info <oid>` without transferring object contents.
     pub fn object_info(&mut self, oid: &Oid) -> Result<(ObjKind, u64), StoreError> {
-        let hex = to_hex(oid);
-        let res = (|| -> Result<(ObjKind, u64), StoreError> {
-            let p = self.ensure_batch_check()?;
-            p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let line = read_bounded_batch_line(&mut p.stdout)?;
-            parse_batch_header(&line, oid)
-        })();
-        if let Err(ref e) = res
-            && e.kind == StoreErrorKind::Failed
-        {
-            self.reset_batch_check();
+        let mut proc = self.take_batch()?;
+        match proc.send_cmd("info", oid) {
+            Ok(info) => {
+                self.batch = Some(proc);
+                Ok(info)
+            }
+            Err(e) => {
+                if e.kind == StoreErrorKind::Missing {
+                    self.batch = Some(proc);
+                } else {
+                    proc.shutdown();
+                }
+                Err(e)
+            }
         }
-        res
     }
 
     /// Read a complete metadata object (`Commit`, `Tree`, `Tag`, or bounded small `Blob`),
-    /// checking `size <= MAX_METADATA_OBJECT_BYTES` BEFORE allocating!
+    /// checking `size <= MAX_METADATA_OBJECT_BYTES` BEFORE allocating.
     pub fn read_object(&mut self, oid: &Oid) -> Result<(ObjKind, Vec<u8>), StoreError> {
-        let hex = to_hex(oid);
+        let mut proc = self.take_batch()?;
         let res = (|| -> Result<(ObjKind, Vec<u8>), StoreError> {
-            let p = self.ensure_batch()?;
-            p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let line = read_bounded_batch_line(&mut p.stdout)?;
-            let (kind, size) = parse_batch_header(&line, oid)?;
+            let (kind, size) = proc.send_cmd("contents", oid)?;
             let len = usize::try_from(size).map_err(|_| StoreError::failed("object size exceeds usize"))?;
             if len > MAX_METADATA_OBJECT_BYTES {
                 return Err(StoreError::failed(format!("{} object {} exceeds 64 MiB limit ({len} bytes)", kind.as_str(), to_hex(oid))));
             }
             let mut buf = vec![0u8; len];
-            p.stdout.read_exact(&mut buf).map_err(|e| StoreError::failed(format!("cat-file body read: {e}")))?;
-            let mut nl = [0u8; 1];
-            p.stdout.read_exact(&mut nl).map_err(|e| StoreError::failed(format!("cat-file trailing newline: {e}")))?;
-            if nl[0] != b'\n' {
-                return Err(StoreError::failed("cat-file framing error: expected trailing newline"));
-            }
+            proc.stdout.read_exact(&mut buf).map_err(|e| StoreError::failed(format!("cat-file body read: {e}")))?;
+            proc.read_trailing_lf()?;
             Ok((kind, buf))
         })();
-        if let Err(ref e) = res
-            && e.kind == StoreErrorKind::Failed
-        {
-            self.reset_batch();
+        match res {
+            Ok(v) => {
+                self.batch = Some(proc);
+                Ok(v)
+            }
+            Err(e) => {
+                if e.kind == StoreErrorKind::Missing {
+                    self.batch = Some(proc);
+                } else {
+                    proc.shutdown();
+                }
+                Err(e)
+            }
         }
-        res
     }
 
-    /// Begin streaming an object directly from `git cat-file --batch`; returns `(kind, size)`.
-    /// Caller MUST read all `size` bytes + trailing `\n` via `batch_stdout_mut()`, or call `reset_batch()` on error.
-    pub(crate) fn begin_stream_object(&mut self, oid: &Oid) -> Result<(ObjKind, u64), StoreError> {
-        let hex = to_hex(oid);
-        let res = (|| -> Result<(ObjKind, u64), StoreError> {
-            let p = self.ensure_batch()?;
-            p.stdin.write_all(hex.as_bytes()).map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.write_all(b"\n").map_err(|e| StoreError::failed(format!("cat-file write: {e}")))?;
-            p.stdin.flush().map_err(|e| StoreError::failed(format!("cat-file flush: {e}")))?;
-            let line = read_bounded_batch_line(&mut p.stdout)?;
-            parse_batch_header(&line, oid)
-        })();
-        if let Err(ref e) = res
-            && e.kind == StoreErrorKind::Failed
-        {
-            self.reset_batch();
+    /// Stream an object of `expected_kind` to `consumer` with owned response framing.
+    ///
+    /// Takes ownership of the `cat-file --batch-command` session during the call and restores it
+    /// ONLY if `consumer` succeeds, consumes all `size` bytes, and the trailing LF matches; any
+    /// error, early exit, or type mismatch kills and reaps the child so streams never desynchronize.
+    pub(crate) fn stream_object<T, E>(
+        &mut self,
+        oid: &Oid,
+        expected_kind: ObjKind,
+        map_store: impl Fn(StoreError) -> E,
+        map_mismatch: impl FnOnce(ObjKind) -> E,
+        consumer: impl FnOnce(u64, &mut dyn Read) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut proc = self.take_batch().map_err(&map_store)?;
+        let (kind, size) = match proc.send_cmd("contents", oid) {
+            Ok(hdr) => hdr,
+            Err(e) => {
+                if e.kind == StoreErrorKind::Missing {
+                    self.batch = Some(proc);
+                } else {
+                    proc.shutdown();
+                }
+                return Err(map_store(e));
+            }
+        };
+        if kind != expected_kind {
+            proc.shutdown();
+            return Err(map_mismatch(kind));
         }
-        res
-    }
-
-    pub(crate) fn batch_stdout_mut(&mut self) -> Option<&mut BufReader<ChildStdout>> {
-        self.batch.as_mut().map(|p| &mut p.stdout)
+        let (out, remaining) = {
+            let mut limited = (&mut proc.stdout).take(size);
+            let r = consumer(size, &mut limited);
+            (r, limited.limit())
+        };
+        match out {
+            Ok(val) if remaining == 0 => match proc.read_trailing_lf() {
+                Ok(()) => {
+                    self.batch = Some(proc);
+                    Ok(val)
+                }
+                Err(e) => {
+                    proc.shutdown();
+                    Err(map_store(e))
+                }
+            },
+            Ok(_) => {
+                proc.shutdown();
+                Err(map_store(StoreError::failed("cat-file stream left unread bytes")))
+            }
+            Err(e) => {
+                proc.shutdown();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -455,7 +456,7 @@ fn read_bounded_batch_line(stdout: &mut BufReader<ChildStdout>) -> Result<String
     let mut limited = stdout.take(u64::try_from(MAX_BATCH_HEADER_BYTES + 1).unwrap());
     let n = limited.read_until(b'\n', &mut raw).map_err(|e| StoreError::failed(format!("cat-file read: {e}")))?;
     if n == 0 {
-        return Err(StoreError::failed("unexpected EOF from git cat-file --batch"));
+        return Err(StoreError::failed("unexpected EOF from git cat-file --batch-command"));
     }
     if raw.len() > MAX_BATCH_HEADER_BYTES || !raw.ends_with(b"\n") {
         return Err(StoreError::failed("cat-file header missing LF or exceeds 512 bytes"));
@@ -482,6 +483,15 @@ fn parse_batch_header(header: &str, oid: &Oid) -> Result<(ObjKind, u64), StoreEr
     Ok((kind, size))
 }
 
+/// Split raw Git commit/tag bytes into `(header_bytes, Some(body_bytes))` when `\n\n` is present,
+/// or `(raw, None)` when no header/body separator exists.
+pub fn split_header_body(raw: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match raw.windows(2).position(|w| w == b"\n\n") {
+        Some(pos) => (&raw[..pos], Some(&raw[pos + 2..])),
+        None => (raw, None),
+    }
+}
+
 /// A parsed entry inside a raw Git tree object (`<mode> <name>\0<20-byte-oid>`).
 #[derive(Clone, Debug)]
 pub struct TreeEntry {
@@ -490,6 +500,16 @@ pub struct TreeEntry {
     pub oid: Oid,
     pub is_dir: bool,
     pub is_gitlink: bool,
+}
+
+impl TreeEntry {
+    /// Append canonical Git tree entry prefix `mode || b' ' || name || b'\0'` to `dst`.
+    pub fn write_prefix(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.mode);
+        dst.push(b' ');
+        dst.extend_from_slice(&self.name);
+        dst.push(0);
+    }
 }
 
 /// Strictly parse a raw Git tree object into entries (validating mode octal digits, NUL framing, and 20-byte OID).
@@ -527,8 +547,8 @@ pub fn parse_git_tree(raw: &[u8]) -> Result<Vec<TreeEntry>, String> {
 /// Parse the canonical `tree <40-hex>` (first header line) and contiguous `parent <40-hex>`
 /// headers of a raw Git commit. Rejects duplicate `tree` lines or out-of-order `parent` lines.
 pub fn parse_commit_tree_and_parents(raw: &[u8]) -> Result<(Oid, Vec<Oid>), String> {
-    let header_end = raw.windows(2).position(|w| w == b"\n\n").unwrap_or(raw.len());
-    let mut lines = raw[..header_end].split(|&b| b == b'\n');
+    let (header_bytes, _) = split_header_body(raw);
+    let mut lines = header_bytes.split(|&b| b == b'\n');
     let first = lines.next().ok_or_else(|| "empty commit header".to_string())?;
     let tree_rest = first.strip_prefix(b"tree ").ok_or_else(|| "commit must begin with tree header".to_string())?;
     let tree_s = std::str::from_utf8(tree_rest).map_err(|_| "non-UTF-8 tree oid".to_string())?;
@@ -555,10 +575,10 @@ pub fn parse_commit_tree_and_parents(raw: &[u8]) -> Result<(Oid, Vec<Oid>), Stri
 
 /// Parse the `object <40-hex>` and `type <kind>` headers of a raw Git annotated tag.
 pub fn parse_tag_target(raw: &[u8]) -> Result<(Oid, ObjKind), String> {
-    let header_end = raw.windows(2).position(|w| w == b"\n\n").unwrap_or(raw.len());
+    let (header_bytes, _) = split_header_body(raw);
     let mut target: Option<Oid> = None;
     let mut kind: Option<ObjKind> = None;
-    for line in raw[..header_end].split(|&b| b == b'\n') {
+    for line in header_bytes.split(|&b| b == b'\n') {
         if let Some(rest) = line.strip_prefix(b"object ") {
             if target.is_some() {
                 return Err("tag has duplicate object headers".into());

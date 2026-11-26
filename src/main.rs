@@ -1,8 +1,8 @@
 use git_signet::blake3_chain::{ContextKeys, DigestCache, compute_commit_digest, peel_to_commit};
 use git_signet::git::GitRepo;
 use git_signet::hooks::{
-    adopt_signet, check_revision, disable_signet, enable_signet, fsck_repo, generate_signet, imprint_here, load_signet_from_path, run_git_wrapper,
-    run_post_commit_hook, run_post_merge_hook, run_post_rewrite_hook, run_reference_transaction_hook, run_x509_program, unadopt_signet,
+    adopt_signet, check_revision, disable_signet, enable_signet, fsck_repo, generate_signet, imprint_here, load_signet_from_path, run_post_commit_hook,
+    run_post_merge_hook, run_post_rewrite_hook, run_reference_transaction_hook, run_x509_program, unadopt_signet,
 };
 use git_signet::id::{decode_lower_hex, format_signet_marker, parse_signet_marker, to_hex};
 use std::env;
@@ -13,8 +13,8 @@ const USAGE: &str = "\
 git-signet — BLINCS signet IDs and BLAKE3 tree/history binding for Git (pre-1.0 experimental)
 
 USAGE:
-  git signet enable [--global | --local] [--wrapper-dir <dir>]
-  git signet disable [--global | --local] [--wrapper-dir <dir>]
+  git signet enable [--global | --local]
+  git signet disable [--global | --local]
   git signet keygen [--file <path>]             generate a BLINCS signet and adopt it
   git signet adopt <seed-file>                  imprint automatically wherever a name carries this signet ID
   git signet unadopt <seed-file>
@@ -22,7 +22,7 @@ USAGE:
   git signet imprint-here <seed-file>           imprint every commit in this one repository
   git signet id [<rev>]                         print a commit's BLAKE3 digest
   git signet check [<rev>] [--signet blincs-<52>] [--expect <64-hex>] [--no-shallow]
-  git signet fsck
+  git signet fsck                               audit all refs (run `git fsck && git signet fsck`)
   git signet version
 ";
 
@@ -45,10 +45,6 @@ fn main() -> ExitCode {
             "__hook-reference-transaction" => {
                 let phase = args.get(1).map(|s| s.as_str()).unwrap_or("");
                 run_reference_transaction_hook(phase).map(|()| 0)
-            }
-            "__wrap-git" => {
-                let real = args.get(1).map(|s| s.as_str()).unwrap_or("");
-                run_git_wrapper(real, &args[2..])
             }
             "enable" => cmd_enable_disable(&args[1..], true),
             "disable" => cmd_enable_disable(&args[1..], false),
@@ -80,19 +76,12 @@ fn main() -> ExitCode {
 
 fn cmd_enable_disable(args: &[String], enable: bool) -> Result<i32, String> {
     let (mut global, mut local) = (false, false);
-    let mut wrapper_dir: Option<PathBuf> = None;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
+    for a in args {
+        match a.as_str() {
             "--global" => global = true,
             "--local" => local = true,
-            "--wrapper-dir" => {
-                i += 1;
-                wrapper_dir = Some(PathBuf::from(args.get(i).ok_or("--wrapper-dir requires a directory")?));
-            }
             other => return Err(format!("unknown option: {other}")),
         }
-        i += 1;
     }
     if global && local {
         return Err("cannot pass both --global and --local".into());
@@ -101,11 +90,11 @@ fn cmd_enable_disable(args: &[String], enable: bool) -> Result<i32, String> {
         global = true;
     }
     if enable {
-        enable_signet(global, wrapper_dir.as_deref())?;
+        enable_signet(global)?;
         let scope = if global { "global" } else { "repository" };
         println!("Configured {scope} native Git hooks (`hook.signet-*`; `core.hooksPath` untouched)");
     } else {
-        disable_signet(global, wrapper_dir.as_deref())?;
+        disable_signet(global)?;
         println!("Disabled git-signet ({})", if global { "global" } else { "local" });
     }
     Ok(0)

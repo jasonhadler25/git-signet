@@ -1,19 +1,22 @@
 //! Unsalted BLAKE3 commit/tree/history binding (`signet-tree` / `signet-parent`).
 //!
 //! Uses BLAKE3 `DeriveKey` mode with four disjoint contexts (`git-signet 2026-11-24 ...`),
-//! streaming blobs directly from `git cat-file --batch` into strictly single-threaded
+//! streaming blobs directly from `git cat-file --batch-command` into strictly single-threaded
 //! `blake3-servil-core` (`TreeHasher::on_this_core` for blobs `<= 16 KiB`, streaming
 //! `convenience::Hasher` for larger blobs) with constant stack memory and zero worker threads.
 //!
 //! All verification and header emission paths use fresh **memory-only** digest maps so
 //! unauthenticated disk bytes never influence verification results or emitted headers.
 
-use crate::git::{Dig, GitRepo, ObjKind, Oid, StoreError, StoreErrorKind, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target};
+use crate::git::{
+    Dig, GitRepo, MAX_TREE_DEPTH, ObjKind, Oid, StoreError, StoreErrorKind, TreeEntry, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target,
+    split_header_body,
+};
 use crate::id::{decode_lower_hex, to_hex};
 use blake3_servil_core::throughput::{TreeHasher, context_key};
 use blake3_servil_core::{ContextKey, Mode, convenience, initialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
+use std::vec::IntoIter;
 
 pub const CTX_FILE: &str = "git-signet 2026-11-24 file";
 pub const CTX_DIR: &str = "git-signet 2026-11-24 directory";
@@ -24,7 +27,6 @@ pub const HEADER_TREE_PREFIX: &[u8] = b"signet-tree ";
 pub const HEADER_PARENT_PREFIX: &[u8] = b"signet-parent ";
 
 const BLOB_STREAM_BUF_LEN: usize = 16_384;
-const MAX_TREE_DEPTH: usize = 4_096;
 
 pub struct ContextKeys {
     pub file: ContextKey,
@@ -68,6 +70,7 @@ impl ContextKeys {
 
 /// Memory-only digest memoization table scoped to one operation.
 ///
+/// Insertion is private to this module so external callers cannot inject unverified digests.
 /// Tracks subtree height alongside tree digests so `MAX_TREE_DEPTH` is enforced even when a
 /// subtree appears multiple times in a DAG.
 pub struct DigestCache {
@@ -91,13 +94,13 @@ impl DigestCache {
         self.commits.get(oid).copied()
     }
 
-    pub fn put_blob(&mut self, oid: Oid, dig: Dig) {
+    fn put_blob(&mut self, oid: Oid, dig: Dig) {
         self.blobs.insert(oid, dig);
     }
-    pub fn put_tree(&mut self, oid: Oid, dig: Dig, height: usize) {
+    fn put_tree(&mut self, oid: Oid, dig: Dig, height: usize) {
         self.trees.insert(oid, (dig, height));
     }
-    pub fn put_commit(&mut self, oid: Oid, dig: Dig) {
+    fn put_commit(&mut self, oid: Oid, dig: Dig) {
         self.commits.insert(oid, dig);
     }
 }
@@ -155,12 +158,12 @@ impl ChainError {
 /// Strictly parse a raw commit object's `tree`, `parent`, `signet-tree`, and `signet-parent` headers.
 pub fn parse_commit(raw: Vec<u8>) -> Result<ParsedCommit, ChainError> {
     let (tree, parents) = parse_commit_tree_and_parents(&raw).map_err(ChainError::mismatch)?;
-    let header_end = raw.windows(2).position(|w| w == b"\n\n").unwrap_or(raw.len());
+    let (header_bytes, _) = split_header_body(&raw);
 
     let mut tree_claims: Vec<(Oid, Dig)> = Vec::new();
     let mut parent_claims: Vec<Dig> = Vec::new();
 
-    for line in raw[..header_end].split(|&b| b == b'\n') {
+    for line in header_bytes.split(|&b| b == b'\n') {
         if line.starts_with(b" ") {
             continue;
         }
@@ -210,46 +213,36 @@ pub fn parse_commit(raw: Vec<u8>) -> Result<ParsedCommit, ChainError> {
     Ok(ParsedCommit { raw, tree, parents, class })
 }
 
-/// Stream a blob directly from `git cat-file --batch` into strictly single-threaded BLAKE3
+/// Stream a blob directly from `git cat-file --batch-command` into strictly single-threaded BLAKE3
 /// (`DeriveKeyWith(CTX_FILE)`) with a constant 16 KiB stack buffer and zero heap blowup.
 pub fn hash_blob_streaming(repo: &mut GitRepo, ctx: &ContextKeys, oid: &Oid, cache: &mut DigestCache) -> Result<Dig, ChainError> {
     if let Some(d) = cache.get_blob(oid) {
         return Ok(d);
     }
-    let (kind, size) = repo.begin_stream_object(oid).map_err(ChainError::store)?;
-    if kind != ObjKind::Blob {
-        repo.reset_batch();
-        return Err(ChainError::mismatch(format!("expected blob for {}, got {}", to_hex(oid), kind.as_str())));
-    }
-    let res = (|| -> Result<Dig, ChainError> {
-        let stdout = repo.batch_stdout_mut().ok_or_else(|| ChainError::store(StoreError::failed("no batch stdout")))?;
-        let mut buf = [0u8; BLOB_STREAM_BUF_LEN];
-        let digest = if size <= u64::try_from(BLOB_STREAM_BUF_LEN).unwrap() {
-            let len = usize::try_from(size).unwrap();
-            stdout.read_exact(&mut buf[..len]).map_err(|e| ChainError::store(StoreError::failed(format!("blob read: {e}"))))?;
-            *TreeHasher::new(Mode::DeriveKeyWith(&ctx.file)).on_this_core().hash(&buf[..len]).as_bytes()
-        } else {
-            let mut hasher = convenience::Hasher::new(Mode::DeriveKeyWith(&ctx.file), None);
-            let mut remaining = size;
-            while remaining > 0 {
-                let want = usize::try_from(remaining.min(u64::try_from(BLOB_STREAM_BUF_LEN).unwrap())).unwrap();
-                stdout.read_exact(&mut buf[..want]).map_err(|e| ChainError::store(StoreError::failed(format!("blob stream read: {e}"))))?;
-                hasher.update(&buf[..want]);
-                remaining -= u64::try_from(want).unwrap();
+    let dig = repo.stream_object(
+        oid,
+        ObjKind::Blob,
+        ChainError::store,
+        |kind| ChainError::mismatch(format!("expected blob for {}, got {}", to_hex(oid), kind.as_str())),
+        |size, reader| {
+            let mut buf = [0u8; BLOB_STREAM_BUF_LEN];
+            if size <= u64::try_from(BLOB_STREAM_BUF_LEN).unwrap() {
+                let len = usize::try_from(size).unwrap();
+                reader.read_exact(&mut buf[..len]).map_err(|e| ChainError::store(StoreError::failed(format!("blob read: {e}"))))?;
+                Ok(*TreeHasher::new(Mode::DeriveKeyWith(&ctx.file)).on_this_core().hash(&buf[..len]).as_bytes())
+            } else {
+                let mut hasher = convenience::Hasher::new(Mode::DeriveKeyWith(&ctx.file), None);
+                let mut remaining = size;
+                while remaining > 0 {
+                    let want = usize::try_from(remaining.min(u64::try_from(BLOB_STREAM_BUF_LEN).unwrap())).unwrap();
+                    reader.read_exact(&mut buf[..want]).map_err(|e| ChainError::store(StoreError::failed(format!("blob stream read: {e}"))))?;
+                    hasher.update(&buf[..want]);
+                    remaining -= u64::try_from(want).unwrap();
+                }
+                Ok(*hasher.finalize().as_bytes())
             }
-            *hasher.finalize().as_bytes()
-        };
-        let mut nl = [0u8; 1];
-        stdout.read_exact(&mut nl).map_err(|e| ChainError::store(StoreError::failed(format!("blob trailing nl: {e}"))))?;
-        if nl[0] != b'\n' {
-            return Err(ChainError::store(StoreError::failed("cat-file framing error after blob")));
-        }
-        Ok(digest)
-    })();
-    if res.is_err() {
-        repo.reset_batch();
-    }
-    let dig = res?;
+        },
+    )?;
     cache.put_blob(*oid, dig);
     Ok(dig)
 }
@@ -262,8 +255,7 @@ pub fn compute_tree_digest(repo: &mut GitRepo, ctx: &ContextKeys, root_oid: &Oid
     }
     struct Frame {
         oid: Oid,
-        entries: Vec<crate::git::TreeEntry>,
-        next_idx: usize,
+        entries: IntoIter<TreeEntry>,
         encoded: Vec<u8>,
         max_child_height: usize,
     }
@@ -273,20 +265,15 @@ pub fn compute_tree_digest(repo: &mut GitRepo, ctx: &ContextKeys, root_oid: &Oid
         return Err(ChainError::mismatch(format!("expected tree for {}, got {}", to_hex(root_oid), kind.as_str())));
     }
     let entries = parse_git_tree(&raw).map_err(ChainError::mismatch)?;
-    let mut stack = vec![Frame { oid: *root_oid, entries, next_idx: 0, encoded: Vec::new(), max_child_height: 0 }];
+    let mut stack = vec![Frame { oid: *root_oid, entries: entries.into_iter(), encoded: Vec::new(), max_child_height: 0 }];
     let mut active = HashSet::new();
     active.insert(*root_oid);
 
     loop {
         let cur_depth = stack.len();
         let top = stack.last_mut().unwrap();
-        if top.next_idx < top.entries.len() {
-            let e = top.entries[top.next_idx].clone();
-            top.next_idx += 1;
-            top.encoded.extend_from_slice(&e.mode);
-            top.encoded.push(b' ');
-            top.encoded.extend_from_slice(&e.name);
-            top.encoded.push(0);
+        if let Some(e) = top.entries.next() {
+            e.write_prefix(&mut top.encoded);
             if e.is_gitlink {
                 top.encoded.extend_from_slice(&e.oid);
             } else if e.is_dir {
@@ -305,7 +292,7 @@ pub fn compute_tree_digest(repo: &mut GitRepo, ctx: &ContextKeys, root_oid: &Oid
                         return Err(ChainError::mismatch(format!("expected subtree for {}, got {}", to_hex(&e.oid), ck.as_str())));
                     }
                     let centries = parse_git_tree(&craw).map_err(ChainError::mismatch)?;
-                    stack.push(Frame { oid: e.oid, entries: centries, next_idx: 0, encoded: Vec::new(), max_child_height: 0 });
+                    stack.push(Frame { oid: e.oid, entries: centries.into_iter(), encoded: Vec::new(), max_child_height: 0 });
                 }
             } else {
                 let d = hash_blob_streaming(repo, ctx, &e.oid, cache)?;
@@ -327,8 +314,9 @@ pub fn compute_tree_digest(repo: &mut GitRepo, ctx: &ContextKeys, root_oid: &Oid
     }
 }
 
-/// Compute the BLAKE3 digest of commit `root_oid` (stopping recursion at carrying commits),
-/// optionally recording every commit OID folded into the computed digest.
+/// Compute the BLAKE3 digest of commit `root_oid` iteratively.
+/// When `folded` is `Some`, records every commit whose BLAKE3 digest was folded into the result
+/// (used by `verify_commit_chain` to track commits genuinely bound by a verified `signet-parent` edge).
 fn compute_commit_digest_inner(
     repo: &mut GitRepo,
     ctx: &ContextKeys,
@@ -336,22 +324,16 @@ fn compute_commit_digest_inner(
     cache: &mut DigestCache,
     mut folded: Option<&mut HashSet<Oid>>,
 ) -> Result<Dig, ChainError> {
-    if let Some(d) = cache.get_commit(root_oid) {
-        if let Some(set) = folded.as_deref_mut() {
-            set.insert(*root_oid);
-        }
+    if let Some(d) = cache.get_commit(root_oid)
+        && folded.is_none()
+    {
         return Ok(d);
     }
+
     let mut stack: Vec<(Oid, Option<ParsedCommit>)> = vec![(*root_oid, None)];
     let mut active: HashSet<Oid> = HashSet::new();
 
     while let Some((oid, parsed_opt)) = stack.pop() {
-        if cache.get_commit(&oid).is_some() {
-            if let Some(set) = folded.as_deref_mut() {
-                set.insert(oid);
-            }
-            continue;
-        }
         let parsed = match parsed_opt {
             Some(p) => p,
             None => {
@@ -415,7 +397,9 @@ pub fn compute_commit_digest(repo: &mut GitRepo, ctx: &ContextKeys, root_oid: &O
 #[derive(Clone, Debug)]
 pub struct VerifyReport {
     pub commit_oid: Oid,
-    pub digest: Dig,
+    /// Tip BLAKE3 digest when computed (`Some` whenever the tip carries headers, `expected_digest`
+    /// was supplied, or `need_tip_digest` was requested; `None` when skipped on an unpinned plain tip).
+    pub digest: Option<Dig>,
     pub carrying_commits: usize,
     pub plain_commits: usize,
     pub tip_carries_lines: bool,
@@ -425,8 +409,8 @@ pub struct VerifyReport {
     pub authenticated_ancestors: HashSet<Oid>,
 }
 
-/// Peel up to 64 annotated tag layers (validating declared target kind and rejecting cycles)
-/// until reaching a commit object. Returns `ChainErrorKind::NotACommit` if the target is a blob/tree.
+/// Peel up to 64 annotated tag layers (classifying via `object_info` first so non-commit blobs
+/// never hit metadata read caps, validating declared target kind, and rejecting cycles).
 pub fn peel_to_commit(repo: &mut GitRepo, start: &Oid) -> Result<Oid, ChainError> {
     let mut cur = *start;
     let mut seen = HashSet::new();
@@ -435,7 +419,7 @@ pub fn peel_to_commit(repo: &mut GitRepo, start: &Oid) -> Result<Oid, ChainError
         if !seen.insert(cur) {
             return Err(ChainError::mismatch("tag cycle"));
         }
-        let (kind, raw) = repo.read_object(&cur).map_err(ChainError::store)?;
+        let (kind, _) = repo.object_info(&cur).map_err(ChainError::store)?;
         if let Some(exp) = expected_kind
             && kind != exp
         {
@@ -444,6 +428,7 @@ pub fn peel_to_commit(repo: &mut GitRepo, start: &Oid) -> Result<Oid, ChainError
         match kind {
             ObjKind::Commit => return Ok(cur),
             ObjKind::Tag => {
+                let (_, raw) = repo.read_object(&cur).map_err(ChainError::store)?;
                 let (next, decl_kind) = parse_tag_target(&raw).map_err(ChainError::mismatch)?;
                 if decl_kind != ObjKind::Commit && decl_kind != ObjKind::Tag {
                     return Err(ChainError::not_a_commit(format!("tag targets {}", decl_kind.as_str())));
@@ -470,8 +455,8 @@ pub fn verify_commit_chain(
     tip: &Oid,
     expected_digest: Option<&Dig>,
     allow_shallow: bool,
+    need_tip_digest: bool,
 ) -> Result<VerifyReport, ChainError> {
-    let grafts: HashSet<Oid> = if allow_shallow { repo.shallow.clone() } else { HashSet::new() };
     let mut cache = DigestCache::memory_only();
     let mut visited: HashSet<Oid> = HashSet::new();
     let mut authenticated: HashSet<Oid> = HashSet::new();
@@ -490,7 +475,7 @@ pub fn verify_commit_chain(
             return Err(ChainError::mismatch(format!("expected commit at {}, got {}", to_hex(&oid), kind.as_str())));
         }
         let parsed = parse_commit(raw)?;
-        let is_graft = grafts.contains(&oid);
+        let is_graft = allow_shallow && repo.shallow.contains(&oid);
         if is_graft && !parsed.parents.is_empty() {
             shallow_boundary_hit = true;
         }
@@ -548,16 +533,16 @@ pub fn verify_commit_chain(
     }
 
     let tip_digest = if let Some(d) = cache.get_commit(tip) {
-        d
-    } else if expected_digest.is_some() || carrying_commits > 0 {
-        compute_commit_digest(repo, ctx, tip, &mut cache)?
+        Some(d)
+    } else if need_tip_digest || expected_digest.is_some() || carrying_commits > 0 {
+        Some(compute_commit_digest(repo, ctx, tip, &mut cache)?)
     } else {
-        [0u8; 32]
+        None
     };
-    if let Some(exp) = expected_digest
-        && tip_digest != *exp
+    if let (Some(exp), Some(actual)) = (expected_digest, tip_digest.as_ref())
+        && actual != exp
     {
-        return Err(ChainError::mismatch(format!("commit {} BLAKE3 digest mismatch: expected {}, got {}", to_hex(tip), to_hex(exp), to_hex(&tip_digest))));
+        return Err(ChainError::mismatch(format!("commit {} BLAKE3 digest mismatch: expected {}, got {}", to_hex(tip), to_hex(exp), to_hex(actual))));
     }
 
     Ok(VerifyReport {
@@ -574,12 +559,7 @@ pub fn verify_commit_chain(
 /// Build a commit payload with canonical `signet-tree` and `signet-parent` headers inserted right after
 /// `committer` (stripping any stale `signet-*` headers and any `gpgsig` header).
 pub fn insert_signet_headers(raw_commit: &[u8], tree_oid: &Oid, tree_dig: &Dig, parent_digs: &[Dig]) -> Result<Vec<u8>, String> {
-    let (header_end, has_sep) = match raw_commit.windows(2).position(|w| w == b"\n\n") {
-        Some(pos) => (pos, true),
-        None => (raw_commit.len(), false),
-    };
-    let header_bytes = &raw_commit[..header_end];
-    let body_bytes = if has_sep { &raw_commit[header_end + 2..] } else { b"" };
+    let (header_bytes, body_opt) = split_header_body(raw_commit);
 
     let lines: Vec<&[u8]> = header_bytes.split(|&b| b == b'\n').collect();
     let mut kept: Vec<&[u8]> = Vec::with_capacity(lines.len());
@@ -614,43 +594,26 @@ pub fn insert_signet_headers(raw_commit: &[u8], tree_oid: &Oid, tree_dig: &Dig, 
 
     let pos = insert_at.unwrap_or(kept.len());
     let mut out = Vec::with_capacity(raw_commit.len() + 128 * new_lines.len());
-    let mut first = true;
-    for l in &kept[..pos] {
-        if !first {
+    let mut ordered = kept[..pos].iter().copied().chain(new_lines.iter().map(Vec::as_slice)).chain(kept[pos..].iter().copied());
+    if let Some(first) = ordered.next() {
+        out.extend_from_slice(first);
+        for line in ordered {
             out.push(b'\n');
+            out.extend_from_slice(line);
         }
-        first = false;
-        out.extend_from_slice(l);
     }
-    for nl in &new_lines {
-        if !first {
-            out.push(b'\n');
-        }
-        first = false;
-        out.extend_from_slice(nl);
-    }
-    for l in &kept[pos..] {
-        if !first {
-            out.push(b'\n');
-        }
-        first = false;
-        out.extend_from_slice(l);
-    }
-    if has_sep {
+    if let Some(body) = body_opt {
         out.extend_from_slice(b"\n\n");
-        out.extend_from_slice(body_bytes);
+        out.extend_from_slice(body);
     }
     Ok(out)
 }
 
 /// Attach a `gpgsig` header block (indented continuation lines) right before the blank separator line.
 pub fn attach_gpgsig(commit_payload: &[u8], armor: &[u8]) -> Vec<u8> {
-    let (header_end, has_sep) = match commit_payload.windows(2).position(|w| w == b"\n\n") {
-        Some(pos) => (pos, true),
-        None => (commit_payload.len(), false),
-    };
+    let (header_bytes, body_opt) = split_header_body(commit_payload);
     let mut out = Vec::with_capacity(commit_payload.len() + armor.len() + 32);
-    out.extend_from_slice(&commit_payload[..header_end]);
+    out.extend_from_slice(header_bytes);
     out.extend_from_slice(b"\ngpgsig ");
     let trimmed = armor.strip_suffix(b"\n").unwrap_or(armor);
     for (idx, line) in trimmed.split(|&b| b == b'\n').enumerate() {
@@ -659,9 +622,9 @@ pub fn attach_gpgsig(commit_payload: &[u8], armor: &[u8]) -> Vec<u8> {
         }
         out.extend_from_slice(line);
     }
-    if has_sep {
+    if let Some(body) = body_opt {
         out.extend_from_slice(b"\n\n");
-        out.extend_from_slice(&commit_payload[header_end + 2..]);
+        out.extend_from_slice(body);
     }
     out
 }

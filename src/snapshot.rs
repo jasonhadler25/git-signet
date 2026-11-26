@@ -1,252 +1,179 @@
-//! Salted whole-snapshot BLINCS imprinting and verification.
+//! Push-side salted whole-snapshot BLINCS imprinting & verification (`BLINCS-128-7x5`).
 //!
-//! Streams a uniquely decodable canonical serialization of a Git commit (or annotated tag targeting
-//! a commit) PLUS the entire depth-first directory/file tree directly into `signet::Signet::imprint_reader`
-//! / `signet::SignetId::verify_reader` under a bounded length-framed BLINCS [`Context`], pulling blobs
-//! directly from `git cat-file --batch` with constant memory and bounded expansion work.
+//! Instead of imprinting only a 20-byte SHA-1 or an unsalted 32-byte digest, `git-signet`
+//! pushes the entire commit (or annotated tag + target commit) AND every reachable tree entry
+//! and raw blob byte straight into Signet's single-pass salted `Sink` (`imprint_with` /
+//! `verify_with`) under bounded contexts (`COMMIT_SNAPSHOT_CTX` / `TAG_SNAPSHOT_CTX`).
 //!
-//! Wire framing (injective / uniquely decodable, domain-separated via BLINCS `Context`):
-//!
+//! Canonical framing (100% unambiguous, length-delimited, raw Git bytes preserved):
 //! ```text
-//!   Commit snapshot (COMMIT_SNAPSHOT_CTX = "git-signet 2026-11-25 commit-snapshot"):
-//!     u64_le(commit_payload.len()) || commit_payload
-//!     <tree walk>
-//!     b"E"
+//! CommitSnapshot (Context = COMMIT_SNAPSHOT_CTX):
+//!   u64_le(len(commit_payload)) || commit_payload || TreeWalk(tree_oid)
 //!
-//!   Tag snapshot (TAG_SNAPSHOT_CTX = "git-signet 2026-11-25 tag-snapshot"):
-//!     u64_le(tag_payload.len()) || tag_payload
-//!     u64_le(target_commit_raw.len()) || target_commit_raw
-//!     <target commit's tree walk>
-//!     b"E"
+//! TagSnapshot (Context = TAG_SNAPSHOT_CTX):
+//!   u64_le(len(tag_payload)) || tag_payload || u64_le(len(target_commit_raw)) || target_commit_raw || TreeWalk(tree_oid)
 //!
-//!   Tree walk (in Git's stored entry order):
-//!     dir (040000):     b"D" || mode || b" " || name || b"\0" || <child walk> || b"E"
-//!     gitlink (160000): b"G" || mode || b" " || name || b"\0" || <20-byte oid>
-//!     blob / symlink:   b"F" || mode || b" " || name || b"\0" || u64_le(blob_len) || <raw blob bytes>
+//! TreeWalk(tree_oid):
+//!   For each entry in raw Git tree order:
+//!     directory (040000):  b"D" || mode || b" " || name || b"\0" || TreeWalk(child_oid) || b"E"
+//!     gitlink   (160000):  b"G" || mode || b" " || name || b"\0" || raw_20_byte_oid
+//!     blob / symlink:      b"F" || mode || b" " || name || b"\0" || u64_le(blob_len) || <raw blob bytes>
+//!   Root closes with b"E".
 //! ```
 
-use crate::git::{GitRepo, ObjKind, Oid, TreeEntry, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target};
+use crate::git::{GitRepo, MAX_TREE_DEPTH, ObjKind, Oid, TreeEntry, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target, split_header_body};
 use crate::id::{X509_BEGIN, decode_imprint_armor};
 use signet::{Context, Imprint, Randomness, Signet, SignetId, VerifyError};
 use std::collections::HashSet;
-use std::io::{self, ErrorKind, Read};
+use std::io::Write;
+use std::vec::IntoIter;
 
 pub const COMMIT_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 commit-snapshot");
 pub const TAG_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 tag-snapshot");
-const MAX_TREE_DEPTH: usize = 4_096;
 const MAX_SNAPSHOT_ENTRIES: usize = 1_000_000;
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const _: () = assert!(MAX_SNAPSHOT_BYTES == 17_179_869_184);
+const STREAM_BUF_LEN: usize = 16_384;
 
-struct TreeFrame {
-    oid: Oid,
-    entries: Vec<TreeEntry>,
-    next_idx: usize,
-}
-
-/// Streaming `Read` adapter over a commit (or tag) plus its entire Git tree.
-pub struct SnapshotReader<'a> {
-    repo: &'a mut GitRepo,
-    buf: Vec<u8>,
-    pos: usize,
-    stack: Vec<TreeFrame>,
-    active_dirs: HashSet<Oid>,
-    blob_remaining: u64,
-    need_blob_nl: bool,
+struct SnapshotBudget {
     entries_seen: usize,
     bytes_emitted: u64,
-    finished: bool,
 }
 
-impl<'a> SnapshotReader<'a> {
-    pub fn for_commit(repo: &'a mut GitRepo, commit_payload: &[u8]) -> Result<Self, String> {
-        let (tree_oid, _) = parse_commit_tree_and_parents(commit_payload)?;
-        let mut buf = Vec::with_capacity(8 + commit_payload.len());
-        buf.extend_from_slice(&u64::try_from(commit_payload.len()).unwrap().to_le_bytes());
-        buf.extend_from_slice(commit_payload);
-        Self::with_root_tree(repo, buf, tree_oid)
+impl SnapshotBudget {
+    fn new() -> Self {
+        Self { entries_seen: 0, bytes_emitted: 0 }
     }
 
-    pub fn for_tag(repo: &'a mut GitRepo, tag_payload: &[u8]) -> Result<Self, String> {
-        let (target_oid, target_kind) = parse_tag_target(tag_payload)?;
-        if target_kind != ObjKind::Commit {
-            return Err(format!("annotated tag targets {}, not a commit", target_kind.as_str()));
-        }
-        let (actual_kind, target_raw) = repo.read_object(&target_oid).map_err(|e| e.message)?;
-        if actual_kind != ObjKind::Commit {
-            return Err(format!("tag target object is {}, not commit", actual_kind.as_str()));
-        }
-        let (tree_oid, _) = parse_commit_tree_and_parents(&target_raw)?;
-        let mut buf = Vec::with_capacity(16 + tag_payload.len() + target_raw.len());
-        buf.extend_from_slice(&u64::try_from(tag_payload.len()).unwrap().to_le_bytes());
-        buf.extend_from_slice(tag_payload);
-        buf.extend_from_slice(&u64::try_from(target_raw.len()).unwrap().to_le_bytes());
-        buf.extend_from_slice(&target_raw);
-        Self::with_root_tree(repo, buf, tree_oid)
-    }
-
-    fn with_root_tree(repo: &'a mut GitRepo, buf: Vec<u8>, tree_oid: Oid) -> Result<Self, String> {
-        let (kind, raw) = repo.read_object(&tree_oid).map_err(|e| e.message)?;
-        if kind != ObjKind::Tree {
-            return Err(format!("commit tree object is {}, not tree", kind.as_str()));
-        }
-        let entries = parse_git_tree(&raw)?;
-        let mut active_dirs = HashSet::new();
-        active_dirs.insert(tree_oid);
-        Ok(Self {
-            repo,
-            buf,
-            pos: 0,
-            stack: vec![TreeFrame { oid: tree_oid, entries, next_idx: 0 }],
-            active_dirs,
-            blob_remaining: 0,
-            need_blob_nl: false,
-            entries_seen: 0,
-            bytes_emitted: 0,
-            finished: false,
-        })
-    }
-
-    /// Ensure the underlying `cat-file --batch` stream is clean if this reader did not finish cleanly.
-    pub fn finish_or_reset(self) {
-        if self.blob_remaining > 0 || self.need_blob_nl {
-            self.repo.reset_batch();
-        }
-    }
-
-    fn account_bytes(&mut self, n: usize) -> io::Result<()> {
-        let add = u64::try_from(n).map_err(|_| io::Error::new(ErrorKind::InvalidData, "snapshot length overflow"))?;
-        self.bytes_emitted = self.bytes_emitted.checked_add(add).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "snapshot length overflow"))?;
+    fn emit(&mut self, out: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
+        let add = u64::try_from(bytes.len()).map_err(|_| "snapshot length overflow".to_string())?;
+        self.bytes_emitted = self.bytes_emitted.checked_add(add).ok_or_else(|| "snapshot length overflow".to_string())?;
         if self.bytes_emitted > MAX_SNAPSHOT_BYTES {
-            self.repo.reset_batch();
-            return Err(io::Error::new(ErrorKind::InvalidData, "snapshot exceeds 16 GiB expansion limit"));
+            return Err("snapshot exceeds 16 GiB expansion limit".into());
+        }
+        out.write_all(bytes).map_err(|e| format!("snapshot write: {e}"))
+    }
+
+    fn count_entry(&mut self) -> Result<(), String> {
+        self.entries_seen += 1;
+        if self.entries_seen > MAX_SNAPSHOT_ENTRIES {
+            return Err("snapshot exceeds maximum expanded entry limit".into());
         }
         Ok(())
     }
+}
 
-    /// Refill `self.buf` or open the next blob stream. Returns `Ok(true)` if bytes are ready, `Ok(false)` at EOF.
-    fn advance(&mut self) -> io::Result<bool> {
-        self.buf.clear();
-        self.pos = 0;
+struct TreeFrame {
+    oid: Oid,
+    entries: IntoIter<TreeEntry>,
+}
 
-        if self.need_blob_nl {
-            let stdout = self.repo.batch_stdout_mut().ok_or_else(|| io::Error::other("missing batch stdout"))?;
-            let mut nl = [0u8; 1];
-            if let Err(e) = stdout.read_exact(&mut nl) {
-                self.repo.reset_batch();
-                return Err(e);
-            }
-            if nl[0] != b'\n' {
-                self.repo.reset_batch();
-                return Err(io::Error::new(ErrorKind::InvalidData, "cat-file framing error after blob"));
-            }
-            self.need_blob_nl = false;
-        }
+fn push_tree_frame(repo: &mut GitRepo, tree_oid: Oid, stack: &mut Vec<TreeFrame>, active_dirs: &mut HashSet<Oid>) -> Result<(), String> {
+    if stack.len() >= MAX_TREE_DEPTH || !active_dirs.insert(tree_oid) {
+        return Err("git tree cycle or excessive depth".into());
+    }
+    let (kind, raw) = repo.read_object(&tree_oid).map_err(|e| e.message)?;
+    if kind != ObjKind::Tree {
+        return Err(format!("tree object is {}, not tree", kind.as_str()));
+    }
+    let entries = parse_git_tree(&raw)?;
+    stack.push(TreeFrame { oid: tree_oid, entries: entries.into_iter() });
+    Ok(())
+}
 
-        if let Some(top) = self.stack.last_mut() {
-            if top.next_idx < top.entries.len() {
-                self.entries_seen += 1;
-                if self.entries_seen > MAX_SNAPSHOT_ENTRIES {
-                    self.repo.reset_batch();
-                    return Err(io::Error::new(ErrorKind::InvalidData, "snapshot exceeds maximum expanded entry limit"));
-                }
-                let entry = top.entries[top.next_idx].clone();
-                top.next_idx += 1;
-                if entry.is_dir {
-                    if self.stack.len() >= MAX_TREE_DEPTH || !self.active_dirs.insert(entry.oid) {
-                        return Err(io::Error::new(ErrorKind::InvalidData, "git tree cycle or excessive depth"));
-                    }
-                    self.buf.push(b'D');
-                    self.buf.extend_from_slice(&entry.mode);
-                    self.buf.push(b' ');
-                    self.buf.extend_from_slice(&entry.name);
-                    self.buf.push(0);
-                    let (kind, raw) = self.repo.read_object(&entry.oid).map_err(|e| io::Error::other(e.message))?;
-                    if kind != ObjKind::Tree {
-                        return Err(io::Error::new(ErrorKind::InvalidData, "directory entry does not point to a tree"));
-                    }
-                    let entries = parse_git_tree(&raw).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                    self.stack.push(TreeFrame { oid: entry.oid, entries, next_idx: 0 });
-                    return Ok(true);
-                } else if entry.is_gitlink {
-                    self.buf.push(b'G');
-                    self.buf.extend_from_slice(&entry.mode);
-                    self.buf.push(b' ');
-                    self.buf.extend_from_slice(&entry.name);
-                    self.buf.push(0);
-                    self.buf.extend_from_slice(&entry.oid);
-                    return Ok(true);
-                } else {
-                    let (kind, size) = self.repo.begin_stream_object(&entry.oid).map_err(|e| io::Error::other(e.message))?;
-                    if kind != ObjKind::Blob {
-                        self.repo.reset_batch();
-                        return Err(io::Error::new(ErrorKind::InvalidData, "file entry does not point to a blob"));
-                    }
-                    self.buf.push(b'F');
-                    self.buf.extend_from_slice(&entry.mode);
-                    self.buf.push(b' ');
-                    self.buf.extend_from_slice(&entry.name);
-                    self.buf.push(0);
-                    self.buf.extend_from_slice(&size.to_le_bytes());
-                    self.blob_remaining = size;
-                    self.need_blob_nl = true;
-                    return Ok(true);
-                }
+/// Stream the canonical snapshot tree walk starting at `root_tree` straight into `out`.
+fn write_tree_walk(repo: &mut GitRepo, root_tree: Oid, out: &mut impl Write, budget: &mut SnapshotBudget) -> Result<(), String> {
+    let mut stack: Vec<TreeFrame> = Vec::new();
+    let mut active_dirs: HashSet<Oid> = HashSet::new();
+    push_tree_frame(repo, root_tree, &mut stack, &mut active_dirs)?;
+
+    let mut header_buf = Vec::with_capacity(128);
+    let mut blob_buf = [0u8; STREAM_BUF_LEN];
+
+    while let Some(top) = stack.last_mut() {
+        if let Some(entry) = top.entries.next() {
+            budget.count_entry()?;
+            header_buf.clear();
+            if entry.is_dir {
+                header_buf.push(b'D');
+                entry.write_prefix(&mut header_buf);
+                budget.emit(out, &header_buf)?;
+                push_tree_frame(repo, entry.oid, &mut stack, &mut active_dirs)?;
+            } else if entry.is_gitlink {
+                header_buf.push(b'G');
+                entry.write_prefix(&mut header_buf);
+                header_buf.extend_from_slice(&entry.oid);
+                budget.emit(out, &header_buf)?;
             } else {
-                let done = self.stack.pop().unwrap();
-                self.active_dirs.remove(&done.oid);
-                self.buf.push(b'E');
-                return Ok(true);
+                header_buf.push(b'F');
+                entry.write_prefix(&mut header_buf);
+                repo.stream_object(
+                    &entry.oid,
+                    ObjKind::Blob,
+                    |e| e.message,
+                    |k| format!("tree entry is {}, expected blob", k.as_str()),
+                    |size, reader| {
+                        header_buf.extend_from_slice(&size.to_le_bytes());
+                        budget.emit(out, &header_buf)?;
+                        let mut remaining = size;
+                        while remaining > 0 {
+                            let want = usize::try_from(remaining.min(u64::try_from(STREAM_BUF_LEN).unwrap())).unwrap();
+                            reader.read_exact(&mut blob_buf[..want]).map_err(|e| format!("blob snapshot read: {e}"))?;
+                            budget.emit(out, &blob_buf[..want])?;
+                            remaining -= u64::try_from(want).unwrap();
+                        }
+                        Ok(())
+                    },
+                )?;
             }
+        } else {
+            let done = stack.pop().unwrap();
+            active_dirs.remove(&done.oid);
+            budget.emit(out, b"E")?;
         }
+    }
+    Ok(())
+}
 
-        self.finished = true;
-        Ok(false)
+/// Push the canonical whole-snapshot byte stream for `kind` (`Commit` or `Tag`) into `out`
+/// (accepting both `signet::Sink` and any `std::io::Write` destination).
+pub fn write_payload_snapshot(repo: &mut GitRepo, kind: ObjKind, payload: &[u8], out: &mut impl Write) -> Result<(), String> {
+    let mut budget = SnapshotBudget::new();
+    match kind {
+        ObjKind::Commit => {
+            let (tree_oid, _) = parse_commit_tree_and_parents(payload)?;
+            budget.emit(out, &u64::try_from(payload.len()).unwrap().to_le_bytes())?;
+            budget.emit(out, payload)?;
+            write_tree_walk(repo, tree_oid, out, &mut budget)
+        }
+        ObjKind::Tag => {
+            let (target_oid, target_kind) = parse_tag_target(payload)?;
+            if target_kind != ObjKind::Commit {
+                return Err(format!("annotated tag targets {}, not a commit", target_kind.as_str()));
+            }
+            let (actual_kind, target_raw) = repo.read_object(&target_oid).map_err(|e| e.message)?;
+            if actual_kind != ObjKind::Commit {
+                return Err(format!("tag target object is {}, not commit", actual_kind.as_str()));
+            }
+            let (tree_oid, _) = parse_commit_tree_and_parents(&target_raw)?;
+            budget.emit(out, &u64::try_from(payload.len()).unwrap().to_le_bytes())?;
+            budget.emit(out, payload)?;
+            budget.emit(out, &u64::try_from(target_raw.len()).unwrap().to_le_bytes())?;
+            budget.emit(out, &target_raw)?;
+            write_tree_walk(repo, tree_oid, out, &mut budget)
+        }
+        other => Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
     }
 }
 
-impl Read for SnapshotReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            if self.pos < self.buf.len() {
-                let n = (self.buf.len() - self.pos).min(out.len());
-                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-                self.pos += n;
-                self.account_bytes(n)?;
-                return Ok(n);
-            }
-            if self.blob_remaining > 0 {
-                let want = usize::try_from(self.blob_remaining.min(u64::try_from(out.len()).unwrap())).unwrap();
-                let stdout = self.repo.batch_stdout_mut().ok_or_else(|| io::Error::other("missing batch stdout"))?;
-                let n = match stdout.read(&mut out[..want]) {
-                    Ok(0) => {
-                        self.repo.reset_batch();
-                        return Err(io::Error::new(ErrorKind::UnexpectedEof, "truncated blob in cat-file stream"));
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        self.repo.reset_batch();
-                        return Err(e);
-                    }
-                };
-                self.blob_remaining -= u64::try_from(n).unwrap();
-                self.account_bytes(n)?;
-                return Ok(n);
-            }
-            if self.finished {
-                return Ok(0);
-            }
-            if !self.advance()? {
-                return Ok(0);
-            }
-        }
+fn context_for_kind(kind: ObjKind) -> Result<Context<'static>, String> {
+    match kind {
+        ObjKind::Commit => Ok(COMMIT_SNAPSHOT_CTX),
+        ObjKind::Tag => Ok(TAG_SNAPSHOT_CTX),
+        other => Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
     }
 }
 
-/// Typed extraction result separating absent armor from malformed/duplicate signature blocks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtractedArmor {
     Present { payload: Vec<u8>, armor: Vec<u8> },
@@ -257,12 +184,7 @@ pub enum ExtractedArmor {
 /// Split a raw Git commit object into `(commit_payload_without_gpgsig, armor_bytes)`.
 /// Distinguishes missing `gpgsig` from duplicate/malformed `gpgsig` headers.
 pub fn extract_commit_imprint(raw_commit: &[u8]) -> ExtractedArmor {
-    let (headers_end, has_sep) = match raw_commit.windows(2).position(|w| w == b"\n\n") {
-        Some(pos) => (pos, true),
-        None => (raw_commit.len(), false),
-    };
-    let header_bytes = &raw_commit[..headers_end];
-    let body_bytes = if has_sep { &raw_commit[headers_end + 2..] } else { b"" };
+    let (header_bytes, body_opt) = split_header_body(raw_commit);
 
     let mut payload_headers: Vec<&[u8]> = Vec::new();
     let mut sig_lines: Option<Vec<&[u8]>> = None;
@@ -303,9 +225,9 @@ pub fn extract_commit_imprint(raw_commit: &[u8]) -> ExtractedArmor {
         }
         payload.extend_from_slice(h);
     }
-    if has_sep {
+    if let Some(body) = body_opt {
         payload.extend_from_slice(b"\n\n");
-        payload.extend_from_slice(body_bytes);
+        payload.extend_from_slice(body);
     }
     ExtractedArmor::Present { payload, armor }
 }
@@ -313,11 +235,10 @@ pub fn extract_commit_imprint(raw_commit: &[u8]) -> ExtractedArmor {
 /// Split a raw Git annotated tag object into `(tag_payload_without_armor, armor_bytes)`.
 /// Distinguishes absent armor from duplicate/malformed imprint blocks.
 pub fn extract_tag_imprint(raw_tag: &[u8]) -> ExtractedArmor {
-    let Some(sep) = raw_tag.windows(2).position(|w| w == b"\n\n") else {
+    let (header_bytes, Some(body)) = split_header_body(raw_tag) else {
         return ExtractedArmor::Malformed("annotated tag has no body".into());
     };
-    let body_start = sep + 2;
-    let body = &raw_tag[body_start..];
+    let body_start = header_bytes.len() + 2;
 
     let mut begin_pos: Option<usize> = None;
     let mut off = 0usize;
@@ -344,39 +265,39 @@ pub fn extract_tag_imprint(raw_tag: &[u8]) -> ExtractedArmor {
 
 /// Produce a salted whole-snapshot BLINCS imprint over an explicitly typed Git commit or annotated tag payload.
 pub fn imprint_payload(repo: &mut GitRepo, kind: ObjKind, signet: &Signet, rng: &Randomness, payload: &[u8]) -> Result<Imprint, String> {
-    let (ctx, mut reader) = match kind {
-        ObjKind::Commit => (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?),
-        ObjKind::Tag => (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?),
-        other => return Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
-    };
-    let res = signet.imprint_reader(rng, ctx, &mut reader).map_err(|e| format!("snapshot imprint failed: {e}"));
-    reader.finish_or_reset();
-    res
+    let ctx = context_for_kind(kind)?;
+    signet.imprint_with(rng, ctx, |sink| write_payload_snapshot(repo, kind, payload, sink))
 }
 
-/// Verify a salted whole-snapshot BLINCS imprint over an explicitly typed Git commit or annotated tag
-/// payload against `expected_id` (if given, `embedded_id == expected_id` is strictly enforced).
-pub fn verify_payload_imprint(repo: &mut GitRepo, kind: ObjKind, payload: &[u8], armor: &[u8], expected_id: Option<&SignetId>) -> Result<SignetId, String> {
-    let (embedded_id, imprint) = decode_imprint_armor(armor)?;
+/// Verify an already-decoded `(SignetId, Imprint)` over an explicitly typed Git commit or annotated
+/// tag payload against `expected_id` (if given, `embedded_id == expected_id` is strictly enforced).
+pub fn verify_decoded_imprint(
+    repo: &mut GitRepo,
+    kind: ObjKind,
+    payload: &[u8],
+    embedded_id: &SignetId,
+    imprint: &Imprint,
+    expected_id: Option<&SignetId>,
+) -> Result<SignetId, String> {
     if let Some(exp) = expected_id
-        && embedded_id != *exp
+        && embedded_id != exp
     {
         return Err(format!(
             "imprint signet ID mismatch: expected {}, got {}",
             crate::id::format_signet_marker(exp),
-            crate::id::format_signet_marker(&embedded_id)
+            crate::id::format_signet_marker(embedded_id)
         ));
     }
-    let (ctx, mut reader) = match kind {
-        ObjKind::Commit => (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?),
-        ObjKind::Tag => (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?),
-        other => return Err(format!("unsupported Git payload kind {} (expected commit or tag)", other.as_str())),
-    };
-    let res = match embedded_id.verify_reader(ctx, &mut reader, &imprint) {
-        Ok(()) => Ok(embedded_id),
+    let ctx = context_for_kind(kind)?;
+    match embedded_id.verify_with(ctx, imprint, |sink| write_payload_snapshot(repo, kind, payload, sink)) {
+        Ok(()) => Ok(*embedded_id),
         Err(VerifyError::Invalid) => Err("BLINCS snapshot imprint verification FAILED".into()),
-        Err(VerifyError::Io(e)) => Err(format!("snapshot verification I/O error: {e}")),
-    };
-    reader.finish_or_reset();
-    res
+        Err(VerifyError::Source(e)) => Err(format!("snapshot verification error: {e}")),
+    }
+}
+
+/// Decode `BLINCSg2` armor and verify the salted whole-snapshot BLINCS imprint over `payload`.
+pub fn verify_payload_imprint(repo: &mut GitRepo, kind: ObjKind, payload: &[u8], armor: &[u8], expected_id: Option<&SignetId>) -> Result<SignetId, String> {
+    let (embedded_id, imprint) = decode_imprint_armor(armor)?;
+    verify_decoded_imprint(repo, kind, payload, &embedded_id, &imprint, expected_id)
 }

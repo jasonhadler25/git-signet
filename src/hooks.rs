@@ -2,26 +2,33 @@
 //! and unified BLAKE3 + transitive-closure BLINCS verification.
 
 use crate::blake3_chain::{
-    ChainError, ChainErrorKind, CommitClass, ContextKeys, DigestCache, attach_gpgsig, compute_commit_digest, compute_tree_digest, insert_signet_headers,
-    parse_commit, peel_to_commit, verify_commit_chain,
+    ChainError, ChainErrorKind, CommitClass, ContextKeys, DigestCache, VerifyReport, attach_gpgsig, compute_commit_digest, compute_tree_digest,
+    insert_signet_headers, parse_commit, peel_to_commit, verify_commit_chain,
 };
-use crate::git::{Dig, GitRepo, MAX_METADATA_OBJECT_BYTES, ObjKind, Oid, WRAPPER_MARKER, ZERO_OID, is_wrapper_script, resolve_real_git, sanitize_for_tty};
+use crate::git::{Dig, GitRepo, MAX_METADATA_OBJECT_BYTES, ObjKind, Oid, ZERO_OID, resolve_real_git, sanitize_for_tty};
 use crate::id::{
-    decode_imprint_armor, decode_lower_hex, encode_imprint_armor, extract_blake3_pin_from_refname, extract_signet_from_refname, extract_signet_from_remote_url,
-    format_signet_marker, parse_signet_marker, to_hex,
+    agree, decode_imprint_armor, decode_lower_hex, encode_imprint_armor, extract_blake3_pin_from_refname, extract_signet_from_refname,
+    extract_signet_from_remote_url, format_signet_marker, parse_signet_marker, to_hex,
 };
-use crate::snapshot::{ExtractedArmor, extract_commit_imprint, extract_tag_imprint, imprint_payload, verify_payload_imprint};
+use crate::snapshot::{ExtractedArmor, extract_commit_imprint, extract_tag_imprint, imprint_payload, verify_decoded_imprint, verify_payload_imprint};
 use signet::{Randomness, SEED_LEN, Signet, SignetId};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SEED_MAGIC: &[u8; 8] = b"BLINCSs2";
 const SEED_FILE_LEN: usize = 8 + SEED_LEN;
 const MAX_HOOK_STDIN_BYTES: usize = MAX_METADATA_OBJECT_BYTES;
+
+const HOOKS: [(&str, &str, &str); 4] = [
+    ("signet-post-commit", "post-commit", "__hook-post-commit"),
+    ("signet-post-merge", "post-merge", "__hook-post-merge"),
+    ("signet-post-rewrite", "post-rewrite", "__hook-post-rewrite"),
+    ("signet-reference-transaction", "reference-transaction", "__hook-reference-transaction"),
+];
 
 pub fn config_root() -> Result<PathBuf, String> {
     if let Ok(explicit) = env::var("GIT_SIGNET_CONFIG_DIR")
@@ -46,8 +53,8 @@ pub fn gitconfigs_dir() -> Result<PathBuf, String> {
     Ok(config_root()?.join("config"))
 }
 
-pub fn randomness_state_dir() -> Result<PathBuf, String> {
-    Ok(config_root()?.join("randomness"))
+pub fn randomness_state_path() -> Result<PathBuf, String> {
+    Ok(config_root()?.join("salt"))
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<(), String> {
@@ -73,29 +80,18 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure_randomness_state() -> Result<PathBuf, String> {
+/// Ensure `~/.config/git-signet/salt` exists (lazily provisioning on first signing/keygen)
+/// and initialize Signet's lock-free `Randomness`. NEVER called during verification or prepared hooks.
+pub fn open_randomness() -> Result<Randomness, String> {
     let root = config_root()?;
     ensure_private_dir(&root)?;
-    let dir = root.join("randomness");
-    if !dir.exists() {
-        Randomness::create(&dir).map_err(|e| format!("create randomness directory {}: {e}", dir.display()))?;
+    let path = root.join("salt");
+    match Randomness::create(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create randomness state {}: {e}", path.display())),
     }
-    Ok(dir)
-}
-
-fn read_os_seed() -> Result<[u8; SEED_LEN], String> {
-    let mut f = File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let meta = f.metadata().map_err(|e| format!("stat /dev/urandom: {e}"))?;
-        if !meta.file_type().is_char_device() {
-            return Err("/dev/urandom is not a character device".into());
-        }
-    }
-    let mut seed = [0u8; SEED_LEN];
-    f.read_exact(&mut seed).map_err(|e| format!("read /dev/urandom: {e}"))?;
-    Ok(seed)
+    Randomness::initialize(&path).map_err(|e| format!("initialize randomness {}: {e}", path.display()))
 }
 
 fn read_bounded_stdin(limit: usize) -> Result<Vec<u8>, String> {
@@ -108,12 +104,11 @@ fn read_bounded_stdin(limit: usize) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Generate a fresh BLINCS signet from OS randomness, store its seed at `~/.config/git-signet/signets/<blincs-52>.seed`
-/// (or `custom_path` if provided), provision randomness state, and return `(seed_path, SignetId)`.
+/// Generate a fresh BLINCS signet via Signet's hedged `Signet::generate(&rng)`, store its seed at
+/// `~/.config/git-signet/signets/<blincs-52>.seed` (or `custom_path`), and return `(seed_path, SignetId)`.
 pub fn generate_signet(custom_path: Option<&Path>) -> Result<(PathBuf, SignetId), String> {
-    ensure_randomness_state()?;
-    let seed = read_os_seed()?;
-    let signet = Signet::from_seed(&seed);
+    let rng = open_randomness()?;
+    let signet = Signet::generate(&rng).map_err(|e| format!("generate signet: {e}"))?;
     let id = signet.id();
     let marker = format_signet_marker(&id);
 
@@ -135,7 +130,7 @@ pub fn generate_signet(custom_path: Option<&Path>) -> Result<(PathBuf, SignetId)
 
     let mut raw = [0u8; SEED_FILE_LEN];
     raw[..8].copy_from_slice(SEED_MAGIC);
-    raw[8..].copy_from_slice(&seed);
+    raw[8..].copy_from_slice(signet.seed());
 
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -192,8 +187,6 @@ fn write_signet_gitconfig(id: &SignetId, seed_path: &Path) -> Result<PathBuf, St
     let seed_abs = fs::canonicalize(seed_path).unwrap_or_else(|_| seed_path.to_path_buf());
     let seed_str = seed_abs.to_str().ok_or("non-UTF-8 seed path")?;
 
-    // Write via `git config --file` into a fresh 0600 temp file so Git's own config encoder
-    // escapes arbitrary path characters (quotes, backslashes, comments, newlines), then rename.
     let _ = fs::remove_file(&tmp_path);
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -227,12 +220,7 @@ fn global_git_cmd() -> Result<Command, String> {
 
 fn git_config_set(global: bool, key: &str, value: &str) -> Result<(), String> {
     let mut cmd = global_git_cmd()?;
-    cmd.arg("config");
-    if global {
-        cmd.arg("--global");
-    } else {
-        cmd.arg("--local");
-    }
+    cmd.arg("config").arg(if global { "--global" } else { "--local" });
     let out = cmd.args([key, value]).output().map_err(|e| format!("git config {key}: {e}"))?;
     if !out.status.success() {
         return Err(format!("git config {key} failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -242,14 +230,8 @@ fn git_config_set(global: bool, key: &str, value: &str) -> Result<(), String> {
 
 fn git_config_unset_all(global: bool, key: &str) -> Result<(), String> {
     let mut cmd = global_git_cmd()?;
-    cmd.arg("config");
-    if global {
-        cmd.arg("--global");
-    } else {
-        cmd.arg("--local");
-    }
+    cmd.arg("config").arg(if global { "--global" } else { "--local" });
     let out = cmd.args(["--unset-all", key]).output().map_err(|e| format!("git config --unset-all {key}: {e}"))?;
-    // Exit 5 means key was absent, which is fine for idempotent disable/unadopt.
     if !out.status.success() && out.status.code() != Some(5) {
         return Err(format!("git config --unset-all {key} failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -267,7 +249,6 @@ fn include_conditions(marker: &str) -> [String; 4] {
 
 /// Adopt a signet seed file so plain `git commit` imprints automatically in repos/branches bound to its `SignetId`.
 pub fn adopt_signet(seed_path: &Path) -> Result<SignetId, String> {
-    ensure_randomness_state()?;
     let signet = load_signet_from_path(seed_path)?;
     let id = signet.id();
     let marker = format_signet_marker(&id);
@@ -294,7 +275,6 @@ pub fn unadopt_signet(seed_path: &Path) -> Result<SignetId, String> {
 
 /// Configure the current repository to imprint every commit with the given signet seed.
 pub fn imprint_here(seed_path: &Path) -> Result<SignetId, String> {
-    ensure_randomness_state()?;
     let signet = load_signet_from_path(seed_path)?;
     let id = signet.id();
     let cfg_path = write_signet_gitconfig(&id, seed_path)?;
@@ -328,9 +308,14 @@ fn supports_native_config_hooks(real_git: &Path) -> bool {
     })
 }
 
-/// Install Git 2.56+ native `[hook]` configuration (no `core.hooksPath` conflict),
-/// `gpg.x509.program` (if not set to another tool), and an optional transparent `git` wrapper.
-pub fn enable_signet(global: bool, wrapper_dir: Option<&Path>) -> Result<(), String> {
+fn is_our_x509_program(configured: &str, exe: &str) -> bool {
+    configured == exe || Path::new(configured).file_name().and_then(|n| n.to_str()) == Some("git-signet")
+}
+
+/// Install Git 2.56+ native `[hook]` configuration (no `core.hooksPath` conflict)
+/// and `gpg.x509.program` (only when unset or already owned by `git-signet`, never clobbering or
+/// shadowing another configured X.509 program).
+pub fn enable_signet(global: bool) -> Result<(), String> {
     let real_git = resolve_real_git()?;
     if !supports_native_config_hooks(&real_git) {
         return Err("git-signet enable requires Git 2.56+ native config hooks (`git hook list`); \
@@ -340,147 +325,39 @@ pub fn enable_signet(global: bool, wrapper_dir: Option<&Path>) -> Result<(), Str
     }
     let exe = current_exe_str()?;
     let q_exe = posix_single_quote(&exe);
-    let hooks = [
-        ("signet-post-commit", "post-commit", format!("{q_exe} __hook-post-commit")),
-        ("signet-post-merge", "post-merge", format!("{q_exe} __hook-post-merge")),
-        ("signet-post-rewrite", "post-rewrite", format!("{q_exe} __hook-post-rewrite")),
-        ("signet-reference-transaction", "reference-transaction", format!("{q_exe} __hook-reference-transaction")),
-    ];
-    for (name, event, cmd_val) in hooks {
+    for (name, event, subcmd) in HOOKS {
         git_config_set(global, &format!("hook.{name}.event"), event)?;
-        git_config_set(global, &format!("hook.{name}.command"), &cmd_val)?;
+        git_config_set(global, &format!("hook.{name}.command"), &format!("{q_exe} {subcmd}"))?;
     }
-    let existing_x509 = global_git_cmd()
-        .ok()
-        .and_then(|mut c| c.args(["config", if global { "--global" } else { "--local" }, "--get", "gpg.x509.program"]).output().ok())
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
-    if existing_x509.as_deref().is_none_or(|p| p == exe || Path::new(p).file_name().and_then(|n| n.to_str()) == Some("git-signet")) {
+    // Check effective (or global) gpg.x509.program so local enable never shadows a custom global program.
+    let mut check = global_git_cmd()?;
+    check.arg("config");
+    if global {
+        check.arg("--global");
+    }
+    let existing =
+        check.args(["--get", "gpg.x509.program"]).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    if existing.as_deref().is_none_or(|p| is_our_x509_program(p, &exe)) {
         git_config_set(global, "gpg.x509.program", &exe)?;
-    }
-    if let Some(dir) = wrapper_dir {
-        install_git_wrapper(dir, &exe)?;
     }
     Ok(())
 }
 
-pub fn disable_signet(global: bool, wrapper_dir: Option<&Path>) -> Result<(), String> {
+pub fn disable_signet(global: bool) -> Result<(), String> {
     let exe = current_exe_str()?;
-    for name in ["signet-post-commit", "signet-post-merge", "signet-post-rewrite", "signet-reference-transaction"] {
+    for (name, _, _) in HOOKS {
         git_config_unset_all(global, &format!("hook.{name}.event"))?;
         git_config_unset_all(global, &format!("hook.{name}.command"))?;
     }
-    let existing_x509 = global_git_cmd()
+    let existing = global_git_cmd()
         .ok()
         .and_then(|mut c| c.args(["config", if global { "--global" } else { "--local" }, "--get", "gpg.x509.program"]).output().ok())
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
-    if existing_x509.as_deref().is_some_and(|p| p == exe || Path::new(p).file_name().and_then(|n| n.to_str()) == Some("git-signet")) {
+    if existing.as_deref().is_some_and(|p| is_our_x509_program(p, &exe)) {
         git_config_unset_all(global, "gpg.x509.program")?;
     }
-    if let Some(dir) = wrapper_dir {
-        let p = dir.join("git");
-        if is_wrapper_script(&p) {
-            let _ = fs::remove_file(&p);
-        }
-    }
     Ok(())
-}
-
-fn install_git_wrapper(dir: &Path, signet_exe: &str) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let wrapper_path = dir.join("git");
-    if wrapper_path.exists() && !is_wrapper_script(&wrapper_path) {
-        return Err(format!("refusing to overwrite non-wrapper file {}", wrapper_path.display()));
-    }
-    let real_git = resolve_real_git()?;
-    let marker = std::str::from_utf8(WRAPPER_MARKER).unwrap();
-    let q_exe = posix_single_quote(signet_exe);
-    let q_real = posix_single_quote(real_git.to_str().ok_or("non-UTF-8 real git path")?);
-    let script = format!(
-        "#!/bin/sh\n\
-         {marker}\n\
-         exec {q_exe} __wrap-git {q_real} \"$@\"\n"
-    );
-    let tmp_path = dir.join(format!(".git-wrapper.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&tmp_path);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o755);
-    }
-    let mut f = opts.open(&tmp_path).map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
-    f.write_all(script.as_bytes()).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
-    drop(f);
-    fs::rename(&tmp_path, &wrapper_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("install {}: {e}", wrapper_path.display())
-    })?;
-    Ok(())
-}
-
-/// Transparent `git` wrapper: forwards everything to real `git`, plus appends `git-signet fsck` on `git fsck`.
-pub fn run_git_wrapper(real_git_arg: &str, git_args: &[String]) -> Result<i32, String> {
-    let real_git = Path::new(real_git_arg);
-    let status = Command::new(real_git).args(git_args).status().map_err(|e| format!("exec real git: {e}"))?;
-    let code = status.code().unwrap_or(1);
-    if code != 0 {
-        return Ok(code);
-    }
-    let (repo_dir, git_dir, subcmd) = parse_git_subcommand(git_args);
-    if subcmd == Some("fsck") {
-        let mut repo = GitRepo::open_with_git_dir(repo_dir.as_deref(), git_dir.as_deref())?;
-        fsck_repo(&mut repo, false)?;
-    }
-    Ok(0)
-}
-
-fn parse_git_subcommand(args: &[String]) -> (Option<PathBuf>, Option<PathBuf>, Option<&str>) {
-    let mut repo_dir: Option<PathBuf> = None;
-    let mut git_dir: Option<PathBuf> = None;
-    let mut i = 0usize;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if let Some(gd) = a.strip_prefix("--git-dir=") {
-            git_dir = Some(PathBuf::from(gd));
-            i += 1;
-            continue;
-        }
-        match a {
-            "-C" => {
-                if let Some(d) = args.get(i + 1) {
-                    let p = PathBuf::from(d);
-                    repo_dir = Some(match repo_dir {
-                        Some(prev) if !p.is_absolute() => prev.join(p),
-                        _ => p,
-                    });
-                    i += 2;
-                    continue;
-                }
-                break;
-            }
-            "--git-dir" => {
-                if let Some(gd) = args.get(i + 1) {
-                    git_dir = Some(PathBuf::from(gd));
-                    i += 2;
-                    continue;
-                }
-                break;
-            }
-            "-c" | "--work-tree" | "--namespace" | "--config-env" => {
-                i += 2;
-                continue;
-            }
-            s if s.starts_with('-') => {
-                i += 1;
-                continue;
-            }
-            sub => return (repo_dir, git_dir, Some(sub)),
-        }
-    }
-    (repo_dir, git_dir, None)
 }
 
 fn infer_x509_payload_kind(payload: &[u8]) -> Result<ObjKind, String> {
@@ -553,8 +430,7 @@ pub fn run_x509_program(args: &[String]) -> Result<i32, String> {
 
         let mut repo = GitRepo::open(None)?;
         let signet = load_signet_from_spec(&spec)?;
-        let rng_path = ensure_randomness_state()?;
-        let rng = Randomness::initialize(&rng_path).map_err(|e| format!("initialize randomness {}: {e}", rng_path.display()))?;
+        let rng = open_randomness()?;
         let imprint = imprint_payload(&mut repo, kind, &signet, &rng, &payload)?;
         let armor = encode_imprint_armor(&signet.id(), &imprint);
 
@@ -641,15 +517,10 @@ pub fn run_post_merge_hook() -> Result<(), String> {
     if parsed.parents.len() < 2 {
         return Ok(());
     }
-    // Check reflog subject: fast-forward merges record `: Fast-forward` and must NEVER be rewritten.
     let reflog = repo.run_output(["log", "-g", "-1", "--format=%gs", "HEAD"])?;
-    if reflog.status.success() {
-        let subj = String::from_utf8_lossy(&reflog.stdout);
-        if subj.contains("Fast-forward") {
-            return Ok(());
-        }
+    if reflog.status.success() && String::from_utf8_lossy(&reflog.stdout).contains("Fast-forward") {
+        return Ok(());
     }
-    // Also refuse to rewrite a merge commit already reachable from any remote-tracking ref.
     let on_remote = repo.run_output(["for-each-ref", "--contains", &to_hex(&head_oid), "refs/remotes/"])?;
     if on_remote.status.success() && !on_remote.stdout.is_empty() {
         return Ok(());
@@ -669,10 +540,8 @@ pub fn run_post_rewrite_hook() -> Result<(), String> {
 /// Add `signet-tree` and `signet-parent` BLAKE3 headers to `oid` if missing or stale.
 ///
 /// Always uses a fresh **memory-only** `DigestCache`. If the commit carried a `BLINCSg2` imprint,
-/// it is re-imprinted ONLY IF:
-/// 1. The existing `BLINCSg2` imprint **cryptographically verifies** against the pre-header commit snapshot, AND
-/// 2. This repository's active `user.signingkey` explicitly resolves to that exact `SignetId` (never
-///    falling back to global `~/.config/git-signet/signets/` seeds without active repo configuration).
+/// it is decoded once, cryptographically verified against the pre-header snapshot, and re-imprinted
+/// ONLY IF this repository's active `user.signingkey` explicitly resolves to that exact `SignetId`.
 pub fn add_blake3_headers_to_commit(repo: &mut GitRepo, oid: &Oid) -> Result<Oid, String> {
     let (kind, raw) = repo.read_object(oid).map_err(|e| e.message)?;
     if kind != ObjKind::Commit {
@@ -691,12 +560,11 @@ pub fn add_blake3_headers_to_commit(repo: &mut GitRepo, oid: &Oid) -> Result<Oid
                 // Non-BLINCS gpgsig (e.g. GPG/SSH): leave untouched rather than stripping another tool's header.
                 return Ok(*oid);
             }
-            Ok((embedded_id, _)) => {
-                // C1 invariant: NEVER acquire a private key based on an unverified embedded ID!
-                verify_payload_imprint(repo, ObjKind::Commit, &orig_payload, &armor, Some(&embedded_id))
+            Ok((embedded_id, imprint)) => {
+                // C1 invariant: verify the decoded imprint over the original snapshot BEFORE acquiring any private key!
+                verify_decoded_imprint(repo, ObjKind::Commit, &orig_payload, &embedded_id, &imprint, None)
                     .map_err(|e| format!("refusing to re-imprint commit with unverified BLINCS imprint: {e}"))?;
-                let signet = load_active_repo_signet(repo, &embedded_id)?;
-                Some(signet)
+                Some(load_active_repo_signet(repo, &embedded_id)?)
             }
         },
     };
@@ -712,8 +580,7 @@ pub fn add_blake3_headers_to_commit(repo: &mut GitRepo, oid: &Oid) -> Result<Oid
 
     let payload = insert_signet_headers(&parsed.raw, &parsed.tree, &tree_dig, &parent_digs)?;
     let final_bytes = if let Some(signet) = verified_reimprint_signet {
-        let rng_path = ensure_randomness_state()?;
-        let rng = Randomness::initialize(&rng_path).map_err(|e| format!("initialize randomness: {e}"))?;
+        let rng = open_randomness()?;
         let imp = imprint_payload(repo, ObjKind::Commit, &signet, &rng, &payload)?;
         let armor = encode_imprint_armor(&signet.id(), &imp);
         attach_gpgsig(&payload, &armor)
@@ -737,12 +604,7 @@ fn load_active_repo_signet(repo: &GitRepo, expected_id: &SignetId) -> Result<Sig
     Ok(s)
 }
 
-/// Determine the governing `SignetId` (if any) for `refname` in `repo`:
-/// - In a non-bare repo, local `refs/heads/*` and `HEAD` are NEVER governed (local work is never refused).
-/// - A `blincs-<52>` in `refname` governs that ref (for remote-tracking refs, tags, and bare-repo refs).
-/// - A `blincs-<52>` in `remote.<name>.url` governs `refs/remotes/<name>/*`, tags arriving with that
-///   remote (or in a single-remote repo), and in a bare repo its own directory basename or single remote.
-/// - Conflicting signet IDs between ref name, remote URL, or bare repo directory name are rejected.
+/// Determine the governing `SignetId` (if any) for `refname` in `repo`.
 pub fn governing_signet(repo: &GitRepo, refname: &str, batch_remote_id: Option<&SignetId>) -> Result<Option<SignetId>, String> {
     if !repo.is_bare && (refname == "HEAD" || refname.starts_with("refs/heads/")) {
         return Ok(None);
@@ -760,30 +622,29 @@ pub fn governing_signet(repo: &GitRepo, refname: &str, batch_remote_id: Option<&
             None
         }
     } else if refname.starts_with("refs/tags/") {
-        if let Some(bid) = batch_remote_id {
-            Some(*bid)
-        } else if repo.is_bare {
-            bare_repo_signet(repo)?
-        } else {
-            single_remote_signet(repo)?
-        }
+        let inferred = if repo.is_bare { bare_repo_signet(repo)? } else { single_remote_signet(repo)? };
+        agree(batch_remote_id.copied(), inferred, |a, b| {
+            format!(
+                "conflicting signet IDs for {}: fetch remote carries {}, repository carries {}",
+                sanitize_for_tty(refname),
+                format_signet_marker(a),
+                format_signet_marker(b)
+            )
+        })?
     } else if repo.is_bare {
         bare_repo_signet(repo)?
     } else {
         None
     };
 
-    match (ref_id, remote_id) {
-        (Some(a), Some(b)) if a != b => Err(format!(
+    agree(ref_id, remote_id, |a, b| {
+        format!(
             "conflicting signet IDs for {}: ref carries {}, repository/remote carries {}",
             sanitize_for_tty(refname),
-            format_signet_marker(&a),
-            format_signet_marker(&b)
-        )),
-        (Some(a), _) => Ok(Some(a)),
-        (None, Some(b)) => Ok(Some(b)),
-        (None, None) => Ok(None),
-    }
+            format_signet_marker(a),
+            format_signet_marker(b)
+        )
+    })
 }
 
 fn single_remote_signet(repo: &GitRepo) -> Result<Option<SignetId>, String> {
@@ -797,14 +658,9 @@ fn single_remote_signet(repo: &GitRepo) -> Result<Option<SignetId>, String> {
 fn bare_repo_signet(repo: &GitRepo) -> Result<Option<SignetId>, String> {
     let dir_id = repo.common_dir.to_str().map(extract_signet_from_remote_url).transpose()?.flatten();
     let rem_id = single_remote_signet(repo)?;
-    match (dir_id, rem_id) {
-        (Some(a), Some(b)) if a != b => {
-            Err(format!("conflicting signet IDs between bare repository path ({}) and remote ({})", format_signet_marker(&a), format_signet_marker(&b)))
-        }
-        (Some(a), _) => Ok(Some(a)),
-        (None, Some(b)) => Ok(Some(b)),
-        (None, None) => Ok(None),
-    }
+    agree(dir_id, rem_id, |a, b| {
+        format!("conflicting signet IDs between bare repository path ({}) and remote ({})", format_signet_marker(a), format_signet_marker(b))
+    })
 }
 
 /// Distinct direct authorization evidence separating commit imprints from annotated-tag imprints.
@@ -815,10 +671,6 @@ pub enum DirectAuth {
     Tag(Oid),
 }
 
-/// Directly verify an object `oid` as carrying a salted whole-snapshot BLINCS imprint under `expected_id`.
-/// Returns `Ok(Some(DirectAuth::Commit(c)))` for a verified commit imprint (including via an unimprinted tag),
-/// `Ok(Some(DirectAuth::Tag(c)))` for a verified annotated-tag imprint targeting `c`, `Ok(None)` when absent,
-/// or `Err` when present armor is malformed, invalid, or signed by a different `SignetId`.
 fn verify_direct_imprint(repo: &mut GitRepo, oid: &Oid, expected_id: &SignetId) -> Result<Option<DirectAuth>, String> {
     let (kind, raw) = repo.read_object(oid).map_err(|e| e.message)?;
     match kind {
@@ -846,12 +698,39 @@ fn verify_direct_imprint(repo: &mut GitRepo, oid: &Oid, expected_id: &SignetId) 
     }
 }
 
-/// Verify a batch of `(refname, old_oid, new_oid)` updates under BOTH:
+/// Unified witness helper: returns `Some(report)` iff `oid` is a directly verified **carrying**
+/// commit under `sid` whose BLAKE3 chain verifies cleanly under `allow_shallow`.
+fn carrying_commit_witness(repo: &mut GitRepo, ctx: &ContextKeys, oid: &Oid, sid: &SignetId, allow_shallow: bool) -> Option<VerifyReport> {
+    let Ok(Some(DirectAuth::Commit(verified_commit))) = verify_direct_imprint(repo, oid, sid) else {
+        return None;
+    };
+    let Ok(rep) = verify_commit_chain(repo, ctx, &verified_commit, None, allow_shallow, false) else {
+        return None;
+    };
+    if rep.tip_carries_lines { Some(rep) } else { None }
+}
+
+/// Typed new target of a Git ref update (eliminating multi-meaning `ZERO_OID` and dead old-OID columns).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefTarget {
+    Delete,
+    Object(Oid),
+    Symbolic(String),
+}
+
+/// One validated ref update from Git's `reference-transaction` hook or `fsck_repo`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub refname: String,
+    pub target: RefTarget,
+}
+
+/// Verify a batch of typed `RefUpdate`s under BOTH:
 /// 1. Full BLAKE3 tree + history verification (`signet-tree` / `signet-parent` + `+blake3-<64>` pins), AND
 /// 2. Formal signet transitive-closure authorization (direct salted whole-snapshot BLINCS imprint OR
 ///    membership in the BLAKE3-verified authenticated ancestor closure of a directly verified carrying
 ///    commit under `S` surviving in the projected post-transaction ref set).
-pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infer_batch_remote_tags: bool) -> Result<(), String> {
+pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[RefUpdate], infer_batch_remote_tags: bool) -> Result<(), String> {
     if updates.is_empty() {
         return Ok(());
     }
@@ -861,8 +740,8 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
     let batch_remote_id = if infer_batch_remote_tags {
         let mut batch_remote_ids: HashSet<[u8; 32]> = HashSet::new();
         let mut saw_unmarked_remote = false;
-        for (refname, _, _) in updates {
-            if let Some(rest) = refname.strip_prefix("refs/remotes/")
+        for u in updates {
+            if let Some(rest) = u.refname.strip_prefix("refs/remotes/")
                 && let Some((rname, _)) = rest.split_once('/')
             {
                 match repo.config_get_checked(&format!("remote.{rname}.url"))? {
@@ -882,14 +761,18 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
     };
 
     let mut authorized_ancestors: HashMap<[u8; 32], HashSet<Oid>> = HashMap::new();
-    let mut pending_ancestor_checks: Vec<(String, Oid, Oid, SignetId)> = Vec::new();
+    let mut pending_ancestor_checks: Vec<(String, Oid, SignetId)> = Vec::new();
     let missing_policy = repo.config_get_checked("signet.missing")?.unwrap_or_else(|| "ignore".into());
-    let updated_refnames: HashSet<&str> = updates.iter().map(|(r, _, _)| r.as_str()).collect();
+    // Track ALL refs touched by this transaction (deletions, object updates, AND symbolic updates)
+    // so only genuinely surviving witnesses in the projected ref set can delegate closure!
+    let updated_refnames: HashSet<&str> = updates.iter().map(|u| u.refname.as_str()).collect();
 
-    for (refname, _old_oid, oid) in updates {
-        if *oid == ZERO_OID {
-            continue; // Deletion
-        }
+    for u in updates {
+        let oid = match &u.target {
+            RefTarget::Delete | RefTarget::Symbolic(_) => continue,
+            RefTarget::Object(o) => o,
+        };
+        let refname = &u.refname;
 
         let b3_pin: Option<Dig> = extract_blake3_pin_from_refname(refname)?;
         let gov_id: Option<SignetId> = governing_signet(repo, refname, batch_remote_id.as_ref())?;
@@ -905,12 +788,9 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
             Err(e) => return Err(format!("ref {} rejected: {}", sanitize_for_tty(refname), e.message)),
         };
 
-        // Full BLAKE3 verification (memory-only cache, never skipping via unauthenticated old_oid!).
-        let report = match verify_commit_chain(repo, &ctx, &commit_oid, b3_pin.as_ref(), true) {
+        let report = match verify_commit_chain(repo, &ctx, &commit_oid, b3_pin.as_ref(), true, false) {
             Ok(r) => r,
             Err(ChainError { kind: ChainErrorKind::Incomplete, message }) if gov_id.is_none() && b3_pin.is_none() => {
-                // Only ignore incomplete history on plain/unpinned/ungoverned tips; if the tip itself
-                // carries `signet-*` claims that cannot be checked, fail closed!
                 let tip_is_carrying = repo
                     .read_object(&commit_oid)
                     .ok()
@@ -941,7 +821,6 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
         if let Some(sid) = gov_id {
             match verify_direct_imprint(repo, oid, &sid)? {
                 Some(DirectAuth::Commit(_)) => {
-                    // Only a directly imprinted CARRYING commit seeds BLAKE3-authenticated closure!
                     if report.tip_carries_lines {
                         authorized_ancestors.entry(*sid.as_bytes()).or_default().extend(report.authenticated_ancestors.iter().copied());
                     }
@@ -951,7 +830,7 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
                     // never delegating closure authority to arbitrary other refs.
                 }
                 None => {
-                    pending_ancestor_checks.push((refname.clone(), *oid, commit_oid, sid));
+                    pending_ancestor_checks.push((refname.clone(), commit_oid, sid));
                 }
             }
         }
@@ -959,24 +838,21 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
 
     // Pass 2: check pending governed refs against surviving (projected post-transaction) witnesses!
     if !pending_ancestor_checks.is_empty() {
-        let needed_ids: HashSet<[u8; 32]> = pending_ancestor_checks.iter().map(|(_, _, _, s)| *s.as_bytes()).collect();
+        let needed_ids: HashSet<[u8; 32]> = pending_ancestor_checks.iter().map(|(_, _, s)| *s.as_bytes()).collect();
         let existing_refs = repo.for_each_ref(None)?;
         for (eref, eoid) in existing_refs {
-            // Skip refs being deleted or replaced in this transaction so a disappearing witness cannot authorize.
             if updated_refnames.contains(eref.as_str()) {
                 continue;
             }
             if let Ok(Some(esid)) = governing_signet(repo, &eref, None)
                 && needed_ids.contains(esid.as_bytes())
-                && let Ok(Some(DirectAuth::Commit(verified_commit))) = verify_direct_imprint(repo, &eoid, &esid)
-                && let Ok(rep) = verify_commit_chain(repo, &ctx, &verified_commit, None, true)
-                && rep.tip_carries_lines
+                && let Some(rep) = carrying_commit_witness(repo, &ctx, &eoid, &esid, true)
             {
                 authorized_ancestors.entry(*esid.as_bytes()).or_default().extend(rep.authenticated_ancestors.iter().copied());
             }
         }
 
-        for (refname, _, commit_oid, sid) in pending_ancestor_checks {
+        for (refname, commit_oid, sid) in pending_ancestor_checks {
             let ok = authorized_ancestors.get(sid.as_bytes()).is_some_and(|set| set.contains(&commit_oid));
             if !ok {
                 return Err(format!(
@@ -992,18 +868,9 @@ pub fn verify_ref_batch(repo: &mut GitRepo, updates: &[(String, Oid, Oid)], infe
     Ok(())
 }
 
-/// One parsed byte-exact record from Git's `reference-transaction` hook input.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefTxRecord {
-    pub refname: String,
-    pub old_oid: Oid,
-    pub new_oid: Oid,
-    pub sym_target: Option<String>,
-}
-
 /// Strictly parse byte-exact Git `reference-transaction` lines (`<old> SP <new> SP <refname>\n`).
-/// Fails closed on any malformed line or invalid OID instead of silently dropping records.
-pub fn parse_reference_transaction_records(raw: &[u8]) -> Result<Vec<RefTxRecord>, String> {
+/// Validates the old token strictly then discards it (never trusting old OIDs as checkpoints).
+pub fn parse_reference_transaction_records(raw: &[u8]) -> Result<Vec<RefUpdate>, String> {
     let mut records = Vec::new();
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() {
@@ -1024,27 +891,27 @@ pub fn parse_reference_transaction_records(raw: &[u8]) -> Result<Vec<RefTxRecord
         }
         let refname = std::str::from_utf8(ref_b).map_err(|_| "non-UTF-8 refname in reference-transaction".to_string())?.to_owned();
 
-        let old_oid = if let Some(sym) = old_b.strip_prefix(b"ref:") {
+        if let Some(sym) = old_b.strip_prefix(b"ref:") {
             if sym.is_empty() {
                 return Err("malformed symbolic old-value in reference-transaction".into());
             }
-            ZERO_OID
         } else {
             let s = std::str::from_utf8(old_b).map_err(|_| "non-UTF-8 old oid in reference-transaction".to_string())?;
-            decode_lower_hex::<20>(s).map_err(|e| format!("bad old oid in reference-transaction: {e}"))?
-        };
+            let _ = decode_lower_hex::<20>(s).map_err(|e| format!("bad old oid in reference-transaction: {e}"))?;
+        }
 
-        if let Some(sym) = new_b.strip_prefix(b"ref:") {
+        let target = if let Some(sym) = new_b.strip_prefix(b"ref:") {
             if sym.is_empty() {
                 return Err("malformed symbolic new-value in reference-transaction".into());
             }
-            let target = std::str::from_utf8(sym).map_err(|_| "non-UTF-8 symbolic target in reference-transaction".to_string())?.to_owned();
-            records.push(RefTxRecord { refname, old_oid, new_oid: ZERO_OID, sym_target: Some(target) });
+            let dest = std::str::from_utf8(sym).map_err(|_| "non-UTF-8 symbolic target in reference-transaction".to_string())?.to_owned();
+            RefTarget::Symbolic(dest)
         } else {
             let s = std::str::from_utf8(new_b).map_err(|_| "non-UTF-8 new oid in reference-transaction".to_string())?;
             let new_oid = decode_lower_hex::<20>(s).map_err(|e| format!("bad new oid in reference-transaction: {e}"))?;
-            records.push(RefTxRecord { refname, old_oid, new_oid, sym_target: None });
-        }
+            if new_oid == ZERO_OID { RefTarget::Delete } else { RefTarget::Object(new_oid) }
+        };
+        records.push(RefUpdate { refname, target });
     }
     Ok(records)
 }
@@ -1083,22 +950,25 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut updates: Vec<(String, Oid, Oid)> = Vec::with_capacity(records.len());
-    for rec in records {
-        if let Some(target) = rec.sym_target {
-            if !is_allowed_symbolic_update(&rec.refname, &target)? {
-                return Err(format!("symbolic ref update refused: {} -> ref:{}", sanitize_for_tty(&rec.refname), sanitize_for_tty(&target)));
+    let mut has_object_or_delete = false;
+    for rec in &records {
+        match &rec.target {
+            RefTarget::Symbolic(target) => {
+                if !is_allowed_symbolic_update(&rec.refname, target)? {
+                    return Err(format!("symbolic ref update refused: {} -> ref:{}", sanitize_for_tty(&rec.refname), sanitize_for_tty(target)));
+                }
             }
-            continue;
+            RefTarget::Object(_) | RefTarget::Delete => has_object_or_delete = true,
         }
-        updates.push((rec.refname, rec.old_oid, rec.new_oid));
     }
-    if updates.is_empty() {
+    // Pure symbolic init updates (e.g. `git init` creating HEAD -> ref:refs/heads/main) run before
+    // the repository is openable by `git rev-parse` and need no object verification.
+    if !has_object_or_delete {
         return Ok(());
     }
 
     let mut repo = GitRepo::open(None)?;
-    verify_ref_batch(&mut repo, &updates, true)
+    verify_ref_batch(&mut repo, &records, true)
 }
 
 /// Check a single revision (BLAKE3 chain + conjunctive `+blake3-` pin/`--expect` + conjunctive
@@ -1124,37 +994,24 @@ pub fn check_revision(
 
     // Conjunctive digest expectation: reject if both refname pin and --expect exist and disagree!
     let pin_dig = extract_blake3_pin_from_refname(&full_ref)?;
-    let want_dig = match (pin_dig, expected_digest.copied()) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(format!("conflicting BLAKE3 expectations: refname pins {}, --expect requests {}", to_hex(&a), to_hex(&b)));
-        }
-        (Some(a), _) => Some(a),
-        (None, b) => b,
-    };
+    let want_dig = agree(pin_dig, expected_digest.copied(), |a, b| {
+        format!("conflicting BLAKE3 expectations: refname pins {}, --expect requests {}", to_hex(a), to_hex(b))
+    })?;
 
-    // Conjunctive signet expectation: reject if both ref/remote governing signet and --signet exist and disagree!
-    let inferred_signet = extract_signet_from_refname(&full_ref)?.or(governing_signet(repo, &full_ref, None)?);
-    let effective_signet = match (inferred_signet, explicit_signet.copied()) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(format!(
-                "conflicting signet expectations: ref/remote requires {}, --signet requests {}",
-                format_signet_marker(&a),
-                format_signet_marker(&b)
-            ));
-        }
-        (Some(a), _) => Some(a),
-        (None, b) => b,
-    };
+    // Conjunctive signet expectation: always check BOTH refname marker and remote/repo governing signet!
+    let ref_signet = extract_signet_from_refname(&full_ref)?;
+    let gov_signet = governing_signet(repo, &full_ref, None)?;
+    let inferred_signet = agree(ref_signet, gov_signet, |a, b| {
+        format!("conflicting signet expectations: ref carries {}, repository/remote requires {}", format_signet_marker(a), format_signet_marker(b))
+    })?;
+    let effective_signet = agree(inferred_signet, explicit_signet.copied(), |a, b| {
+        format!("conflicting signet expectations: ref/remote requires {}, --signet requests {}", format_signet_marker(a), format_signet_marker(b))
+    })?;
 
     let ctx = ContextKeys::new();
     let commit_oid = peel_to_commit(repo, &oid).map_err(|e| e.message)?;
-    let report = verify_commit_chain(repo, &ctx, &commit_oid, want_dig.as_ref(), !no_shallow).map_err(|e| e.message)?;
-    let shown_digest = if report.carrying_commits == 0 && want_dig.is_none() {
-        let mut cache = DigestCache::memory_only();
-        compute_commit_digest(repo, &ctx, &commit_oid, &mut cache).map_err(|e| e.message)?
-    } else {
-        report.digest
-    };
+    let report = verify_commit_chain(repo, &ctx, &commit_oid, want_dig.as_ref(), !no_shallow, true).map_err(|e| e.message)?;
+    let shown_digest = report.digest.ok_or_else(|| "missing computed tip digest".to_string())?;
 
     let mut summary = format!(
         "MATCH {}\n  blake3:  {}\n  commits: {} carrying lines, {} plain{}",
@@ -1178,9 +1035,7 @@ pub fn check_revision(
                 for (eref, eoid) in repo.for_each_ref(None)? {
                     if let Ok(Some(esid)) = governing_signet(repo, &eref, None)
                         && esid == sid
-                        && let Ok(Some(DirectAuth::Commit(vcommit))) = verify_direct_imprint(repo, &eoid, &sid)
-                        && let Ok(rep) = verify_commit_chain(repo, &ctx, &vcommit, None, !no_shallow)
-                        && rep.tip_carries_lines
+                        && let Some(rep) = carrying_commit_witness(repo, &ctx, &eoid, &sid, !no_shallow)
                         && rep.authenticated_ancestors.contains(&commit_oid)
                     {
                         in_closure = true;
@@ -1197,8 +1052,8 @@ pub fn check_revision(
         let (_, raw_c) = repo.read_object(&commit_oid).map_err(|e| e.message)?;
         match extract_commit_imprint(&raw_c) {
             ExtractedArmor::Present { payload, armor } => {
-                if decode_imprint_armor(&armor).is_ok() {
-                    let id = verify_payload_imprint(repo, ObjKind::Commit, &payload, &armor, None)?;
+                if let Ok((embedded_id, imprint)) = decode_imprint_armor(&armor) {
+                    let id = verify_decoded_imprint(repo, ObjKind::Commit, &payload, &embedded_id, &imprint, None)?;
                     summary.push_str(&format!("\n  imprint: valid snapshot imprint by {} (ungoverned ref)", format_signet_marker(&id)));
                 }
             }
@@ -1212,7 +1067,7 @@ pub fn check_revision(
 
 /// Verify every ref in `repo` (BLAKE3 chains + BLINCS signet authorization, without cross-remote batch inference).
 pub fn fsck_repo(repo: &mut GitRepo, verbose: bool) -> Result<usize, String> {
-    let refs: Vec<(String, Oid, Oid)> = repo.for_each_ref(None)?.into_iter().map(|(r, o)| (r, ZERO_OID, o)).collect();
+    let refs: Vec<RefUpdate> = repo.for_each_ref(None)?.into_iter().map(|(refname, oid)| RefUpdate { refname, target: RefTarget::Object(oid) }).collect();
     verify_ref_batch(repo, &refs, false)?;
     if verbose {
         println!("git-signet fsck: {} ref(s) verified cleanly.", refs.len());
