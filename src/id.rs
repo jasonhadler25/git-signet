@@ -1,15 +1,16 @@
 //! Self-certifying BLINCS signet IDs (`blincs-<52-base32>`), BLAKE3 digest markers (`+blake3-<64-hex>`),
-//! and strict `BLINCSg1` PEM armor for Git `gpg.format = x509` imprints.
+//! and strict `BLINCSg2` PEM armor for Git `gpg.format = x509` imprints (`BLINCS-128-7x5`).
 
-use blincs::{IMPRINT_LEN, Imprint, SIGNET_ID_LEN, SignetId};
+use signet::{IMPRINT_LEN, Imprint, SIGNET_ID_LEN, SignetId};
 
 pub const SIGNET_PREFIX: &str = "blincs-";
 pub const SIGNET_B32_LEN: usize = 52;
 pub const BLAKE3_PREFIX: &str = "blake3-";
 pub const BLAKE3_HEX_LEN: usize = 64;
 
-pub const ARMOR_MAGIC: &[u8; 8] = b"BLINCSg1";
-pub const ARMOR_RAW_LEN: usize = ARMOR_MAGIC.len() + SIGNET_ID_LEN + IMPRINT_LEN; // 5,656 bytes
+pub const ARMOR_MAGIC: &[u8; 8] = b"BLINCSg2";
+pub const ARMOR_RAW_LEN: usize = ARMOR_MAGIC.len() + SIGNET_ID_LEN + IMPRINT_LEN; // 7,432 bytes
+const _: () = assert!(ARMOR_RAW_LEN == 7432);
 pub const X509_BEGIN: &[u8] = b"-----BEGIN SIGNED MESSAGE-----";
 pub const X509_END: &[u8] = b"-----END SIGNED MESSAGE-----";
 
@@ -279,7 +280,7 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Encode `(SignetId, Imprint)` as Git `gpg.format = x509` PEM armor (`BLINCSg1 || id || imprint`).
+/// Encode `(SignetId, Imprint)` as Git `gpg.format = x509` PEM armor (`BLINCSg2 || id || imprint`).
 pub fn encode_imprint_armor(id: &SignetId, imprint: &Imprint) -> Vec<u8> {
     let mut raw = Vec::with_capacity(ARMOR_RAW_LEN);
     raw.extend_from_slice(ARMOR_MAGIC);
@@ -300,7 +301,7 @@ pub fn encode_imprint_armor(id: &SignetId, imprint: &Imprint) -> Vec<u8> {
     out
 }
 
-/// Strictly decode `BLINCSg1` PEM armor into `(SignetId, Imprint)`.
+/// Strictly decode `BLINCSg2` PEM armor into `(SignetId, Imprint)`.
 pub fn decode_imprint_armor(armor: &[u8]) -> Result<(SignetId, Imprint), String> {
     let trimmed = armor.strip_suffix(b"\n").unwrap_or(armor);
     let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
@@ -318,7 +319,7 @@ pub fn decode_imprint_armor(armor: &[u8]) -> Result<(SignetId, Imprint), String>
     }
     let raw = base64_decode(&b64)?;
     if raw.len() != ARMOR_RAW_LEN || &raw[..ARMOR_MAGIC.len()] != ARMOR_MAGIC {
-        return Err(format!("imprint payload is not a valid BLINCSg1 imprint (got {} bytes)", raw.len()));
+        return Err(format!("imprint payload is not a valid BLINCSg2 imprint (got {} bytes)", raw.len()));
     }
     let id = SignetId::try_from(&raw[8..8 + SIGNET_ID_LEN]).map_err(|_| "bad signet ID length".to_string())?;
     let imp = Imprint::try_from(&raw[8 + SIGNET_ID_LEN..]).map_err(|_| "bad imprint length".to_string())?;

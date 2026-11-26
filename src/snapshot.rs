@@ -1,19 +1,19 @@
-//! Salted whole-snapshot BLINCS imprinting and verification (zero pre-hashing!).
+//! Salted whole-snapshot BLINCS imprinting and verification.
 //!
 //! Streams a uniquely decodable canonical serialization of a Git commit (or annotated tag targeting
-//! a commit) PLUS the entire depth-first directory/file tree directly into `blincs::Signet::imprint_reader`
-//! / `blincs::SignetId::verify_reader`, pulling blobs directly from `git cat-file --batch` with
-//! constant memory so even multi-gigabyte repositories never buffer in RAM.
+//! a commit) PLUS the entire depth-first directory/file tree directly into `signet::Signet::imprint_reader`
+//! / `signet::SignetId::verify_reader` under a bounded length-framed BLINCS [`Context`], pulling blobs
+//! directly from `git cat-file --batch` with constant memory so multi-gigabyte repositories never buffer in RAM.
 //!
-//! Wire framing (injective / uniquely decodable):
-//!   Commit snapshot:
-//!     b"git-signet 2026-11-24 commit-snapshot\0"
+//! Wire framing (injective / uniquely decodable, domain-separated via BLINCS `Context`):
+//!
+//! ```text
+//!   Commit snapshot (COMMIT_SNAPSHOT_CTX = "git-signet 2026-11-25 commit-snapshot"):
 //!     u64_le(commit_payload.len()) || commit_payload
 //!     <tree walk>
 //!     b"E"
 //!
-//!   Tag snapshot (tag targeting a commit):
-//!     b"git-signet 2026-11-24 tag-snapshot\0"
+//!   Tag snapshot (TAG_SNAPSHOT_CTX = "git-signet 2026-11-25 tag-snapshot"):
 //!     u64_le(tag_payload.len()) || tag_payload
 //!     u64_le(target_commit_raw.len()) || target_commit_raw
 //!     <target commit's tree walk>
@@ -23,15 +23,16 @@
 //!     dir (040000):     b"D" || mode || b" " || name || b"\0" || <child walk> || b"E"
 //!     gitlink (160000): b"G" || mode || b" " || name || b"\0" || <20-byte oid>
 //!     blob / symlink:   b"F" || mode || b" " || name || b"\0" || u64_le(blob_len) || <raw blob bytes>
+//! ```
 
 use crate::git::{GitRepo, ObjKind, Oid, TreeEntry, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target};
 use crate::id::{X509_BEGIN, decode_imprint_armor};
-use blincs::{Imprint, Randomness, Signet, SignetId};
+use signet::{Context, Imprint, Randomness, Signet, SignetId, VerifyError};
 use std::collections::HashSet;
 use std::io::{self, ErrorKind, Read};
 
-pub const COMMIT_SNAPSHOT_PREFIX: &[u8] = b"git-signet 2026-11-24 commit-snapshot\0";
-pub const TAG_SNAPSHOT_PREFIX: &[u8] = b"git-signet 2026-11-24 tag-snapshot\0";
+pub const COMMIT_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 commit-snapshot");
+pub const TAG_SNAPSHOT_CTX: Context<'static> = Context::new(b"git-signet 2026-11-25 tag-snapshot");
 const MAX_TREE_DEPTH: usize = 4_096;
 
 struct TreeFrame {
@@ -40,7 +41,7 @@ struct TreeFrame {
     next_idx: usize,
 }
 
-/// Zero-pre-hash streaming `Read` adapter over a commit (or tag) plus its entire Git tree.
+/// Streaming `Read` adapter over a commit (or tag) plus its entire Git tree.
 pub struct SnapshotReader<'a> {
     repo: &'a mut GitRepo,
     buf: Vec<u8>,
@@ -55,8 +56,7 @@ pub struct SnapshotReader<'a> {
 impl<'a> SnapshotReader<'a> {
     pub fn for_commit(repo: &'a mut GitRepo, commit_payload: &[u8]) -> Result<Self, String> {
         let (tree_oid, _) = parse_commit_tree_and_parents(commit_payload)?;
-        let mut buf = Vec::with_capacity(COMMIT_SNAPSHOT_PREFIX.len() + 8 + commit_payload.len());
-        buf.extend_from_slice(COMMIT_SNAPSHOT_PREFIX);
+        let mut buf = Vec::with_capacity(8 + commit_payload.len());
         buf.extend_from_slice(&u64::try_from(commit_payload.len()).unwrap().to_le_bytes());
         buf.extend_from_slice(commit_payload);
         Self::with_root_tree(repo, buf, tree_oid)
@@ -72,8 +72,7 @@ impl<'a> SnapshotReader<'a> {
             return Err(format!("tag target object is {}, not commit", actual_kind.as_str()));
         }
         let (tree_oid, _) = parse_commit_tree_and_parents(&target_raw)?;
-        let mut buf = Vec::with_capacity(TAG_SNAPSHOT_PREFIX.len() + 16 + tag_payload.len() + target_raw.len());
-        buf.extend_from_slice(TAG_SNAPSHOT_PREFIX);
+        let mut buf = Vec::with_capacity(16 + tag_payload.len() + target_raw.len());
         buf.extend_from_slice(&u64::try_from(tag_payload.len()).unwrap().to_le_bytes());
         buf.extend_from_slice(tag_payload);
         buf.extend_from_slice(&u64::try_from(target_raw.len()).unwrap().to_le_bytes());
@@ -301,14 +300,14 @@ pub fn extract_tag_imprint(raw_tag: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String>
 
 /// Produce a salted whole-snapshot BLINCS imprint over a Git commit or annotated tag payload.
 pub fn imprint_payload(repo: &mut GitRepo, signet: &Signet, rng: &Randomness, payload: &[u8]) -> Result<Imprint, String> {
-    let reader = if payload.starts_with(b"tree ") {
-        SnapshotReader::for_commit(repo, payload)?
+    let (ctx, reader) = if payload.starts_with(b"tree ") {
+        (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?)
     } else if payload.starts_with(b"object ") {
-        SnapshotReader::for_tag(repo, payload)?
+        (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?)
     } else {
         return Err("unsupported Git payload (expected commit or annotated tag)".into());
     };
-    signet.imprint_reader(rng, reader).map_err(|e| format!("snapshot imprint failed: {e}"))
+    signet.imprint_reader(rng, ctx, reader).map_err(|e| format!("snapshot imprint failed: {e}"))
 }
 
 /// Verify a salted whole-snapshot BLINCS imprint against `expected_id` (if given, `embedded_id == expected_id`
@@ -324,16 +323,16 @@ pub fn verify_payload_imprint(repo: &mut GitRepo, payload: &[u8], armor: &[u8], 
             crate::id::format_signet_marker(&embedded_id)
         ));
     }
-    let reader = if payload.starts_with(b"tree ") {
-        SnapshotReader::for_commit(repo, payload)?
+    let (ctx, reader) = if payload.starts_with(b"tree ") {
+        (COMMIT_SNAPSHOT_CTX, SnapshotReader::for_commit(repo, payload)?)
     } else if payload.starts_with(b"object ") {
-        SnapshotReader::for_tag(repo, payload)?
+        (TAG_SNAPSHOT_CTX, SnapshotReader::for_tag(repo, payload)?)
     } else {
         return Err("unsupported Git payload (expected commit or annotated tag)".into());
     };
-    let ok = embedded_id.verify_reader(reader, &imprint).map_err(|e| format!("snapshot verification I/O error: {e}"))?;
-    if !ok {
-        return Err("BLINCS snapshot imprint verification FAILED".into());
+    match embedded_id.verify_reader(ctx, reader, &imprint) {
+        Ok(()) => Ok(embedded_id),
+        Err(VerifyError::Invalid) => Err("BLINCS snapshot imprint verification FAILED".into()),
+        Err(VerifyError::Io(e)) => Err(format!("snapshot verification I/O error: {e}")),
     }
-    Ok(embedded_id)
 }

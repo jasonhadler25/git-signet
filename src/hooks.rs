@@ -11,7 +11,7 @@ use crate::id::{
     format_signet_marker, parse_signet_marker, to_hex,
 };
 use crate::snapshot::{extract_commit_imprint, extract_tag_imprint, imprint_payload, verify_payload_imprint};
-use blincs::{Randomness, SEED_LEN, Signet, SignetId};
+use signet::{Randomness, SEED_LEN, Signet, SignetId};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -19,7 +19,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SEED_MAGIC: &[u8; 8] = b"BLINCSs1";
+const SEED_MAGIC: &[u8; 8] = b"BLINCSs2";
 const SEED_FILE_LEN: usize = 8 + SEED_LEN;
 
 pub fn config_root() -> Result<PathBuf, String> {
@@ -45,8 +45,8 @@ pub fn gitconfigs_dir() -> Result<PathBuf, String> {
     Ok(config_root()?.join("config"))
 }
 
-pub fn randomness_state_path() -> Result<PathBuf, String> {
-    Ok(config_root()?.join("randomness.state"))
+pub fn randomness_state_dir() -> Result<PathBuf, String> {
+    Ok(config_root()?.join("randomness"))
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<(), String> {
@@ -65,11 +65,11 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
 pub fn ensure_randomness_state() -> Result<PathBuf, String> {
     let root = config_root()?;
     ensure_private_dir(&root)?;
-    let path = root.join("randomness.state");
-    if !path.exists() {
-        Randomness::create(&path).map_err(|e| format!("create randomness state {}: {e}", path.display()))?;
+    let dir = root.join("randomness");
+    if !dir.exists() {
+        Randomness::create(&dir).map_err(|e| format!("create randomness directory {}: {e}", dir.display()))?;
     }
-    Ok(path)
+    Ok(dir)
 }
 
 fn read_os_seed() -> Result<[u8; SEED_LEN], String> {
@@ -129,11 +129,11 @@ pub fn generate_signet(custom_path: Option<&Path>) -> Result<(PathBuf, SignetId)
     Ok((path, id))
 }
 
-/// Read a `BLINCSs1` seed file and construct the `Signet`.
+/// Read a `BLINCSs2` seed file and construct the `Signet`.
 pub fn load_signet_from_path(path: &Path) -> Result<Signet, String> {
     let raw = fs::read(path).map_err(|e| format!("read signet seed {}: {e}", path.display()))?;
     if raw.len() != SEED_FILE_LEN || &raw[..8] != SEED_MAGIC {
-        return Err(format!("{} is not a BLINCS signet seed file (expected 40 bytes starting with BLINCSs1)", path.display()));
+        return Err(format!("{} is not a BLINCS signet seed file (expected 40 bytes starting with BLINCSs2)", path.display()));
     }
     let seed: [u8; SEED_LEN] = raw[8..].try_into().unwrap();
     Ok(Signet::from_seed(&seed))
@@ -572,7 +572,7 @@ pub fn run_post_rewrite_hook() -> Result<(), String> {
 }
 
 /// Add `signet-tree` and `signet-parent` BLAKE3 headers to `oid` if missing or stale; if the commit
-/// carried a `BLINCSg1` imprint, re-imprint the new commit + snapshot under that exact signet.
+/// carried a `BLINCSg2` imprint, re-imprint the new commit + snapshot under that exact signet.
 pub fn add_blake3_headers_to_commit(repo: &mut GitRepo, oid: &Oid) -> Result<Oid, String> {
     let (kind, raw) = repo.read_object(oid).map_err(|e| e.message)?;
     if kind != ObjKind::Commit {

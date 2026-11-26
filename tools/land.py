@@ -33,6 +33,13 @@ def main():
     run(["cargo", "fmt", "--", "--check"], "rustfmt check")
     run([sys.executable, "tools/counts.py"], "shipped safety counts")
     run(["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], "clippy (-D warnings)")
+    doc_env = os.environ.copy()
+    doc_env["RUSTDOCFLAGS"] = "-D warnings"
+    print("=== rustdoc (-D warnings) ===")
+    res = subprocess.run(["cargo", "doc", "--no-deps", "--locked"], cwd=ROOT, env=doc_env)
+    if res.returncode != 0:
+        print(f"FAIL: rustdoc (-D warnings) (exit {res.returncode})", file=sys.stderr)
+        sys.exit(res.returncode)
     run(["cargo", "nextest", "run", "--locked"], "cargo nextest")
     run(["cargo", "test", "--doc", "--locked"], "doctests")
     if not args.skip_controls:

@@ -186,7 +186,7 @@ fn cmd_id(args: &[String]) -> Result<i32, String> {
 
 fn cmd_check(args: &[String]) -> Result<i32, String> {
     let mut rev: Option<&str> = None;
-    let mut explicit_signet: Option<blincs::SignetId> = None;
+    let mut explicit_signet: Option<signet::SignetId> = None;
     let mut expected_dig: Option<[u8; 32]> = None;
     let mut no_shallow = false;
     let mut i = 0usize;

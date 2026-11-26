@@ -1,13 +1,14 @@
 //! Unsalted BLAKE3 commit/tree/history binding (`signet-tree` / `signet-parent`).
 //!
 //! Uses BLAKE3 `DeriveKey` mode with four disjoint contexts (`git-signet 2026-11-24 ...`),
-//! streaming blobs directly from `git cat-file --batch` into `blake3-servil`'s multi-core
-//! `Pipeline` (for large blobs >= 64 KiB) or `TreeHasher` (for small blobs) with zero RAM blowup.
+//! streaming blobs directly from `git cat-file --batch` into strictly single-threaded
+//! `blake3-servil-core` (`TreeHasher::on_this_core` for blobs `<= 16 KiB`, streaming
+//! `convenience::Hasher` for larger blobs) with constant stack memory and zero worker threads.
 
 use crate::git::{Dig, GitRepo, ObjKind, Oid, StoreError, StoreErrorKind, parse_commit_tree_and_parents, parse_git_tree, parse_tag_target};
 use crate::id::{decode_lower_hex, to_hex};
-use blake3_servil::throughput::{Event, Limits, Pipeline, TreeHasher, block_on, context_key};
-use blake3_servil::{ContextKey, Mode, convenience, initialize_multithreaded};
+use blake3_servil_core::throughput::{TreeHasher, context_key};
+use blake3_servil_core::{ContextKey, Mode, convenience, initialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,8 +28,7 @@ const KIND_BLOB: u8 = 1;
 const KIND_TREE: u8 = 2;
 const KIND_COMMIT: u8 = 3;
 
-const LARGE_BLOB_PIPELINE_THRESHOLD: u64 = 65_536;
-const PIPELINE_ROOMS: usize = 32;
+const BLOB_STREAM_BUF_LEN: usize = 16_384;
 const MAX_TREE_DEPTH: usize = 4_096;
 
 pub struct ContextKeys {
@@ -46,7 +46,7 @@ impl Default for ContextKeys {
 
 impl ContextKeys {
     pub fn new() -> Self {
-        initialize_multithreaded(None);
+        initialize();
         Self { file: context_key(CTX_FILE), dir: context_key(CTX_DIR), commit: context_key(CTX_COMMIT), plain: context_key(CTX_PLAIN) }
     }
 
@@ -286,8 +286,8 @@ pub fn parse_commit(raw: Vec<u8>) -> Result<ParsedCommit, ChainError> {
     Ok(ParsedCommit { raw, tree, parents, class })
 }
 
-/// Stream a blob directly from `git cat-file --batch` into BLAKE3 (`DeriveKeyWith(CTX_FILE)`),
-/// using `blake3-servil`'s multi-core `Pipeline` for blobs >= 64 KiB and zero heap blowup.
+/// Stream a blob directly from `git cat-file --batch` into strictly single-threaded BLAKE3
+/// (`DeriveKeyWith(CTX_FILE)`) with a constant 16 KiB stack buffer and zero heap blowup.
 pub fn hash_blob_streaming(repo: &mut GitRepo, ctx: &ContextKeys, oid: &Oid, cache: &mut DigestCache) -> Result<Dig, ChainError> {
     if let Some(d) = cache.get_blob(oid) {
         return Ok(d);
@@ -299,40 +299,21 @@ pub fn hash_blob_streaming(repo: &mut GitRepo, ctx: &ContextKeys, oid: &Oid, cac
     }
     let res = (|| -> Result<Dig, ChainError> {
         let stdout = repo.batch_stdout_mut().ok_or_else(|| ChainError::store(StoreError::failed("no batch stdout")))?;
-        let digest = if size < LARGE_BLOB_PIPELINE_THRESHOLD {
+        let mut buf = [0u8; BLOB_STREAM_BUF_LEN];
+        let digest = if size <= u64::try_from(BLOB_STREAM_BUF_LEN).unwrap() {
             let len = usize::try_from(size).unwrap();
-            let mut buf = vec![0u8; len];
-            stdout.read_exact(&mut buf).map_err(|e| ChainError::store(StoreError::failed(format!("blob read: {e}"))))?;
-            *TreeHasher::new(Mode::DeriveKeyWith(&ctx.file)).on_this_core().hash(&buf).as_bytes()
+            stdout.read_exact(&mut buf[..len]).map_err(|e| ChainError::store(StoreError::failed(format!("blob read: {e}"))))?;
+            *TreeHasher::new(Mode::DeriveKeyWith(&ctx.file)).on_this_core().hash(&buf[..len]).as_bytes()
         } else {
-            let mut pipe: Pipeline<()> = Pipeline::new(Mode::DeriveKeyWith(&ctx.file), Limits { messages: 1, rooms: PIPELINE_ROOMS });
-            let mut msg = block_on(pipe.message((), Some(size)));
+            let mut hasher = convenience::Hasher::new(Mode::DeriveKeyWith(&ctx.file), None);
             let mut remaining = size;
             while remaining > 0 {
-                let mut room = block_on(pipe.room());
-                let want = usize::try_from(remaining.min(u64::try_from(room.bytes_mut().len()).unwrap())).unwrap();
-                if let Err(e) = stdout.read_exact(&mut room.bytes_mut()[..want]) {
-                    pipe.abort(msg);
-                    loop {
-                        match pipe.next_event() {
-                            Some(Event::Aborted { .. }) => break,
-                            Some(_) => panic!("unexpected Pipeline event after abort"),
-                            None => block_on(pipe.ready()),
-                        }
-                    }
-                    return Err(ChainError::store(StoreError::failed(format!("blob stream read: {e}"))));
-                }
-                pipe.commit(&mut msg, &mut room, want);
+                let want = usize::try_from(remaining.min(u64::try_from(BLOB_STREAM_BUF_LEN).unwrap())).unwrap();
+                stdout.read_exact(&mut buf[..want]).map_err(|e| ChainError::store(StoreError::failed(format!("blob stream read: {e}"))))?;
+                hasher.update(&buf[..want]);
                 remaining -= u64::try_from(want).unwrap();
             }
-            pipe.end(msg);
-            loop {
-                match pipe.next_event() {
-                    Some(Event::Hashed { hash, .. }) => break *hash.as_bytes(),
-                    Some(_) => panic!("unexpected Pipeline event after end"),
-                    None => block_on(pipe.ready()),
-                }
-            }
+            *hasher.finalize().as_bytes()
         };
         let mut nl = [0u8; 1];
         stdout.read_exact(&mut nl).map_err(|e| ChainError::store(StoreError::failed(format!("blob trailing nl: {e}"))))?;

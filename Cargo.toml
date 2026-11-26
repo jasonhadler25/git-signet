@@ -1,6 +1,6 @@
 [package]
 name = "git-signet"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Self-certifying BLINCS signet IDs and BLAKE3 tree/history binding for Git (pre-1.0 experimental)"
 repository = "https://github.com/jasonhadler25/git-signet"
@@ -12,8 +12,8 @@ name = "git-signet"
 path = "src/main.rs"
 
 [dependencies]
-blake3-servil = "=0.10.0"
-blincs = { git = "https://github.com/jasonhadler25/blincs", rev = "38bbc96807ecc5a6d67493b785d15d013dc5a510" }
+blake3-servil-core = "=0.11.0"
+signet = { git = "https://github.com/jasonhadler25/blincs", rev = "9c674f10d2d7b9c8b16161cbfad3a217fa4c9a7b" }
 
 [profile.test]
 opt-level = 3

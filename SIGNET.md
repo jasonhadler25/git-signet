@@ -1,4 +1,4 @@
-# git-signet Specification (v0.3.0, Pre-1.0)
+# git-signet Specification (v0.4.0, Pre-1.0)
 
 > **Pre-1.0 — Experimental & Unsupported.** This specification is not yet frozen and may change incompatibly before 1.0.
 
@@ -29,7 +29,7 @@ A BLINCS `SignetId` is 32 bytes (256 bits). Its canonical text encoding is:
 
 ---
 
-## 2. BLINCS Imprint Armor (`BLINCSg1`)
+## 2. BLINCS Imprint Armor (`BLINCSg2`)
 
 Imprints are stored in Git's standard `gpgsig` commit header (or appended to annotated tag payloads) using X.509/CMS-compatible PEM framing so stock Git (`gpg.format = x509`) handles insertion and `git verify-commit` / `git verify-tag` natively:
 
@@ -39,15 +39,15 @@ Imprints are stored in Git's standard `gpgsig` commit header (or appended to ann
 -----END SIGNED MESSAGE-----
 ```
 
-The decoded binary payload is **exactly 5,656 bytes**:
+The decoded binary payload is **exactly 7,432 bytes**:
 
 | Offset | Length | Contents |
 |---|---|---|
-| `0` | `8` | ASCII magic `BLINCSg1` |
+| `0` | `8` | ASCII magic `BLINCSg2` |
 | `8` | `32` | `SignetId` bytes |
-| `40` | `5616` | Raw BLINCS `Imprint` bytes (`blincs::IMPRINT_LEN`) |
+| `40` | `7392` | Raw `BLINCS-128-7x5` `Imprint` bytes (`signet::IMPRINT_LEN`) |
 
-Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 5,656 bytes or whose magic is not `BLINCSg1`.
+Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank lines) and reject any payload whose length is not 7,432 bytes or whose magic is not `BLINCSg2`.
 
 ---
 
@@ -63,7 +63,7 @@ Decoders MUST enforce strict base64 (canonical padding bits, no unexpected blank
 | Plain / stale commit | `"git-signet 2026-11-24 plain commit"` |
 
 ### 3.1 File digest
-`D_file(blob)` is `BLAKE3_derive_key("git-signet 2026-11-24 file", raw_blob_bytes)` (computed streaming; blobs `>= 64 KiB` use `blake3-servil`'s multi-core `Pipeline`).
+`D_file(blob)` is `BLAKE3_derive_key("git-signet 2026-11-24 file", raw_blob_bytes)` (computed in one strictly single-threaded streaming pass via `blake3-servil-core` with a constant 16 KiB stack buffer).
 
 ### 3.2 Directory digest
 Given a Git tree object parsed into canonical entries `(mode, name, oid)`:
@@ -91,25 +91,23 @@ Verification always uses a fresh **memory-only** digest map; unauthenticated dis
 
 ---
 
-## 4. Salted Whole-Snapshot BLINCS Imprinting (Zero Pre-Hashing)
+## 4. Salted Whole-Snapshot BLINCS Imprinting
 
-Rather than imprinting only the commit's ~300 bytes (which would rely on unsalted BLAKE3 collision resistance for tree contents), `git-signet` streams the **entire commit (or annotated tag + target commit) plus a canonical depth-first walk of its entire tree and every file byte** directly into `blincs::Signet::imprint_reader` and `blincs::SignetId::verify_reader`. Because BLINCS mixes a fresh per-imprint random salt into the streaming message hash, forging a second tree under the same imprint requires breaking salted second-preimage resistance rather than unsalted collision resistance.
+`git-signet` streams the **entire commit (or annotated tag + target commit) plus a canonical depth-first walk of its entire tree and every file byte** directly into `signet::Signet::imprint_reader` and `signet::SignetId::verify_reader` under a bounded length-framed BLINCS `Context`. Because BLINCS mixes a fresh per-imprint random salt and the framed `Context` into the streaming message hash, forging a second tree under the same imprint requires breaking salted second-preimage resistance rather than unsalted collision resistance.
 
 ### 4.1 Commit snapshot stream
-Framed as:
+Imprinted and verified with BLINCS `Context = b"git-signet 2026-11-25 commit-snapshot"`, streaming:
 ```text
-"git-signet 2026-11-24 commit-snapshot\0"
-|| u64_le(commit_payload.len()) || commit_payload
+u64_le(commit_payload.len()) || commit_payload
 || TreeWalk(commit.tree)
 || b'E'
 ```
 where `commit_payload` is the exact raw commit bytes with the `gpgsig` header removed.
 
 ### 4.2 Annotated tag snapshot stream
-If an annotated tag targeting a commit (`type commit`) carries its own `BLINCSg1` imprint (e.g. `git tag -s`), its payload is framed together with its target commit and full target tree as:
+If an annotated tag targeting a commit (`type commit`) carries its own `BLINCSg2` imprint (e.g. `git tag -s`), it is imprinted and verified with BLINCS `Context = b"git-signet 2026-11-25 tag-snapshot"`, streaming its payload together with its target commit and full target tree as:
 ```text
-"git-signet 2026-11-24 tag-snapshot\0"
-|| u64_le(tag_payload.len()) || tag_payload
+u64_le(tag_payload.len()) || tag_payload
 || u64_le(target_commit_raw.len()) || target_commit_raw
 || TreeWalk(target_commit.tree)
 || b'E'
@@ -139,15 +137,16 @@ For a ref update `R -> O`:
 A ref update `R -> O` governed by signet ID `S` is **accepted** if and only if:
 1. Its BLAKE3 commit chain verifies cleanly (stopping at `.git/shallow` grafts only when shallow mode is permitted, and always verifying the tip's `signet-tree`), **and**
 2. One of the following holds:
-   - **(a) Direct commit imprint:** `O` is a commit (or tag peeling to a commit `C`) carrying a `BLINCSg1` imprint that verifies `CommitSnapshot(C)` under `S`; or
-   - **(b) Direct annotated-tag imprint:** `O` is an annotated tag carrying a `BLINCSg1` imprint that verifies `TagSnapshot(O)` under `S`; or
+   - **(a) Direct commit imprint:** `O` is a commit (or tag peeling to a commit `C`) carrying a `BLINCSg2` imprint that verifies `CommitSnapshot(C)` under `S`; or
+   - **(b) Direct annotated-tag imprint:** `O` is an annotated tag carrying a `BLINCSg2` imprint that verifies `TagSnapshot(O)` under `S`; or
    - **(c) Transitive ancestor closure:** `O` is a commit (or tag peeling to a commit `C`) that lies in the **BLAKE3-verified transitive ancestor closure** of a commit `T` whose direct imprint under `S` has been verified (either in the same transaction batch or on an existing governed ref of the repository).
 
 Rule (c) lets repositories adopt `git-signet` without rewriting historical commits or old release tags: once a newer tip commit `T` carries `signet-parent` bindings reaching back to `C` and a valid BLINCS imprint under `S`, old tags pointing to `C` verify automatically, while any commit outside `T`'s verified ancestor closure is refused.
 
 ---
 
-## 6. Seed File Storage
+## 6. Seed File & Randomness Storage
 
-Seed files generated by `git signet keygen` are stored with mode `0600` at `~/.config/git-signet/signets/<blincs-52>.seed` as **exactly 40 bytes**:
-- `b"BLINCSs1"` (8-byte magic) || 32-byte OS randomness seed (read from character device `/dev/urandom`).
+- Seed files generated by `git signet keygen` are stored with mode `0600` at `~/.config/git-signet/signets/<blincs-52>.seed` as **exactly 40 bytes**:
+  - `b"BLINCSs2"` (8-byte magic) || 32-byte OS randomness seed (read from character device `/dev/urandom`).
+- Per-machine signing randomness state is stored in the lock-free `0700` seed directory `~/.config/git-signet/randomness` managed by `signet::Randomness`.

@@ -1,6 +1,6 @@
 # Quality & Verification
 
-`git-signet` follows a fail-closed, zero-`unsafe` build and verification discipline modeled on the companion [`blincs`](https://github.com/jasonhadler25/blincs) crate.
+`git-signet` follows a fail-closed, zero-`unsafe` build and verification discipline modeled on the companion [`signet`](https://github.com/jasonhadler25/blincs) crate.
 
 ## Landing Gate (`python3 tools/land.py`)
 
@@ -12,9 +12,9 @@ Every commit must pass all gates on a clean working tree:
    - `debug_asserts = 0` (runtime invariants stay active in release builds)
    - `truncation_allows = 0` (narrowing integer casts denied in `[lints.clippy]`)
    - `drop_impls = 0` (no custom destructors in shipped library code)
-3. **Static analysis:** `cargo clippy --all-targets --locked -- -D warnings`
+3. **Static analysis & docs:** `cargo clippy --all-targets --locked -- -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked`
 4. **Process-isolated tests:** `cargo nextest run --locked` (enforced by `tools/require_nextest.rs`), running end-to-end against real stock `git` subprocesses, plus `cargo test --doc --locked`.
-5. **Planted-fault verification controls (`tools/controls.py`):** copies the tree into a temporary directory, injects 8 targeted security defects one at a time, and requires every defect to fail the test suite:
+5. **Planted-fault verification controls (`tools/controls.py`):** copies the tree into a temporary directory, injects 9 targeted security defects one at a time, and requires every defect to fail the test suite:
    - `skip_direct_imprint_check`
    - `skip_signet_tree_compare`
    - `skip_transitive_closure_rejection`
@@ -23,6 +23,7 @@ Every commit must pass all gates on a clean working tree:
    - `skip_armor_magic_check`
    - `allow_conflicting_signets`
    - `disable_no_shallow_enforcement`
+   - `drop_snapshot_context`
 
 ## Bugs Caught by These Checks During Development
 

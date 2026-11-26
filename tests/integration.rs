@@ -1,6 +1,5 @@
 include!("../tools/require_nextest.rs");
 
-use blincs::{Randomness, SEED_LEN, Signet, SignetId};
 use git_signet::blake3_chain::{
     CommitClass, ContextKeys, DigestCache, attach_gpgsig, compute_commit_digest, insert_signet_headers, parse_commit, verify_commit_chain,
 };
@@ -9,7 +8,8 @@ use git_signet::id::{
     decode_imprint_armor, decode_signet_b32, encode_imprint_armor, encode_signet_b32, extract_blake3_pin_from_refname, extract_signet_from_refname,
     extract_signet_from_remote_url, format_signet_marker, parse_signet_marker, to_hex,
 };
-use git_signet::snapshot::{SnapshotReader, extract_commit_imprint, imprint_payload, verify_payload_imprint};
+use git_signet::snapshot::{COMMIT_SNAPSHOT_CTX, SnapshotReader, TAG_SNAPSHOT_CTX, extract_commit_imprint, imprint_payload, verify_payload_imprint};
+use signet::{Context, Randomness, SEED_LEN, Signet, SignetId};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -156,11 +156,11 @@ fn id_encoding_marker_extraction_and_armor_validation() {
 
     // Armor round-trip and rejection.
     let tmp = temp_dir("armor");
-    let state = tmp.join("state.bin");
-    Randomness::create(&state).unwrap();
-    let rng = Randomness::initialize(&state).unwrap();
+    let rng_dir = tmp.join("rng");
+    Randomness::create(&rng_dir).unwrap();
+    let rng = Randomness::initialize(&rng_dir).unwrap();
     let signet = Signet::from_seed(&[0x22u8; SEED_LEN]);
-    let imp = signet.imprint(&rng, b"armor-test");
+    let imp = signet.imprint(&rng, Context::EMPTY, b"armor-test");
     let armor = encode_imprint_armor(&signet.id(), &imp);
     let (dec_id, dec_imp) = decode_imprint_armor(&armor).unwrap();
     assert_eq!(dec_id, signet.id());
@@ -193,7 +193,7 @@ fn end_to_end_imprint_verify_clone_and_adversarial_rejections() {
     fs::create_dir_all(&remote).unwrap();
     env.git_ok(&remote, &["init", "--bare"]);
 
-    // Clone and make two commits (including nested dir + 128 KiB file exercising Pipeline streaming!).
+    // Clone and make two commits (including nested dir + 128 KiB file exercising streaming!).
     let work = env.root.join("work");
     env.git_ok(&env.root, &["clone", remote.to_str().unwrap(), work.to_str().unwrap()]);
     fs::create_dir_all(work.join("src/deep")).unwrap();
@@ -202,10 +202,10 @@ fn end_to_end_imprint_verify_clone_and_adversarial_rejections() {
     env.git_ok(&work, &["add", "."]);
     env.git_ok(&work, &["commit", "-m", "initial commit"]);
 
-    // Verify commit carries BOTH `signet-tree blake3` AND `gpgsig` `BLINCSg1`, and passes stock `git verify-commit`!
+    // Verify commit carries BOTH `signet-tree blake3` AND `gpgsig` `BLINCSg2`, and passes stock `git verify-commit`!
     let raw_head = env.git_ok(&work, &["cat-file", "commit", "HEAD"]);
     assert!(raw_head.contains("signet-tree blake3 "), "missing signet-tree header:\n{raw_head}");
-    assert!(raw_head.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "missing BLINCSg1 gpgsig:\n{raw_head}");
+    assert!(raw_head.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "missing BLINCSg2 gpgsig:\n{raw_head}");
     let vc = env.git_ok(&work, &["verify-commit", "HEAD"]);
     let _ = vc;
     let chk = env.signet_ok(&work, &["check", "HEAD", "--signet", &marker_a]);
@@ -270,7 +270,7 @@ fn wrapper_git_fsck_amend_and_branch_bound_signet() {
     env.git_ok(&repo, &["add", "f.txt"]);
     env.git_ok(&repo, &["commit", "-m", "branch-bound initial"]);
 
-    // Verify commit carries signet-tree + BLINCSg1 imprint AND passes `git verify-commit`!
+    // Verify commit carries signet-tree + BLINCSg2 imprint AND passes `git verify-commit`!
     env.git_ok(&repo, &["verify-commit", "HEAD"]);
     let chk1 = env.signet_ok(&repo, &["check", "HEAD"]);
     assert!(chk1.contains("direct salted snapshot imprint"));
@@ -479,18 +479,21 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     let (_, raw_commit) = repo.read_object(&head_oid).unwrap();
     let (payload, armor) = extract_commit_imprint(&raw_commit).unwrap();
 
-    // Valid snapshot verifies cleanly AND streams the actual file contents (zero pre-hashing!).
+    // Valid snapshot verifies cleanly under COMMIT_SNAPSHOT_CTX (rejects wrong/empty Context)
+    // and streams the actual file contents directly!
     let sid = verify_payload_imprint(&mut repo, &payload, &armor, None).unwrap();
     let (_, decoded_imp) = decode_imprint_armor(&armor).unwrap();
     let mut snap_bytes = Vec::new();
     SnapshotReader::for_commit(&mut repo, &payload).unwrap().read_to_end(&mut snap_bytes).unwrap();
-    assert!(snap_bytes.starts_with(b"git-signet 2026-11-24 commit-snapshot\0"));
+    assert_eq!(&snap_bytes[..8], &u64::try_from(payload.len()).unwrap().to_le_bytes());
     assert!(snap_bytes.windows(b"benign file\n".len()).any(|w| w == b"benign file\n"), "SnapshotReader omitted tree blob bytes!");
-    assert!(sid.verify(&snap_bytes, &decoded_imp), "BLINCS imprint did not verify against exact SnapshotReader bytes!");
+    assert!(sid.verify(COMMIT_SNAPSHOT_CTX, &snap_bytes, &decoded_imp).is_ok(), "BLINCS imprint did not verify against exact SnapshotReader bytes!");
+    assert!(sid.verify(Context::EMPTY, &snap_bytes, &decoded_imp).is_err(), "BLINCS imprint accepted empty context!");
+    assert!(sid.verify(TAG_SNAPSHOT_CTX, &snap_bytes, &decoded_imp).is_err(), "BLINCS commit imprint accepted tag context!");
     // Flip 1 byte in the streamed file content while keeping commit bytes 100% unchanged (simulated SHA-1/BLAKE3 collision!):
     let pos = snap_bytes.windows(b"benign file\n".len()).position(|w| w == b"benign file\n").unwrap();
     snap_bytes[pos] ^= 1;
-    assert!(!sid.verify(&snap_bytes, &decoded_imp), "BLINCS imprint accepted tampered file content with unchanged commit bytes!");
+    assert!(sid.verify(COMMIT_SNAPSHOT_CTX, &snap_bytes, &decoded_imp).is_err(), "BLINCS imprint accepted tampered file content with unchanged commit bytes!");
 
     // Tamper 1 byte in `signet-tree` header inside a fresh commit (re-imprinted or not) -> BLAKE3 chain rejects!
     let parsed = parse_commit(raw_commit.clone()).unwrap();
@@ -517,7 +520,7 @@ fn salted_snapshot_catches_tree_swap_and_digest_pin_and_annotated_tag() {
     assert!(matches!(parse_commit(stale_payload).unwrap().class, CommitClass::Stale));
 
     // Confirm `imprint_payload` + `attach_gpgsig` round-trip directly through library API too.
-    let rng = Randomness::initialize(env.config_dir.join("randomness.state")).unwrap();
+    let rng = Randomness::initialize(env.config_dir.join("randomness")).unwrap();
     let signet = Signet::from_seed(&[0x33u8; SEED_LEN]);
     let imp2 = imprint_payload(&mut repo, &signet, &rng, &payload).unwrap();
     let armor2 = encode_imprint_armor(&signet.id(), &imp2);

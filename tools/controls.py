@@ -63,6 +63,12 @@ CONTROLS = [
         "let grafts = if allow_shallow { load_shallow_grafts(repo) } else { HashSet::new() };",
         "let grafts = if true || allow_shallow { load_shallow_grafts(repo) } else { HashSet::new() };",
     ),
+    (
+        "drop_snapshot_context",
+        "src/snapshot.rs",
+        "match embedded_id.verify_reader(ctx, reader, &imprint) {",
+        "match embedded_id.verify_reader(Context::EMPTY, reader, &imprint) {",
+    ),
 ]
 
 
