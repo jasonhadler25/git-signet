@@ -4,7 +4,7 @@
 
 ## Cryptographic Properties & Assumptions
 
-`git-signet` relies exclusively on **BLAKE3** (both directly for `signet-tree` / `signet-parent` binding via strictly single-threaded `blake3-servil-core` and inside [Signet](https://github.com/jasonhadler25/signet)'s `BLINCS-128-A2` implementation):
+`git-signet` relies exclusively on **BLAKE3** (both directly for `signet-tree` / `signet-parent` binding via strictly single-threaded `blake3-servil-core` and inside [Signet](https://github.com/jasonhadler25/signet)'s `BLINCS-48-X` implementation):
 
 1. **Salted whole-snapshot BLINCS imprints (tip commits and imprinted tags):**
    - Every commit or tag imprint pushes the object bytes plus every filename, mode, gitlink, and raw file byte of the entire tree directly into `signet::Signet::imprint_with` / `SignetId::verify_with` under a bounded length-framed BLINCS `Context` with a fresh per-imprint random salt.
