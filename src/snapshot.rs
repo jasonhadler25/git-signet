@@ -1,4 +1,4 @@
-//! Push-side salted whole-snapshot BLINCS imprinting & verification (`BLINCS-128-7x5`).
+//! Push-side salted whole-snapshot BLINCS imprinting & verification (`BLINCS-128-A2`).
 //!
 //! Instead of imprinting only a 20-byte SHA-1 or an unsalted 32-byte digest, `git-signet`
 //! pushes the entire commit (or annotated tag + target commit) AND every reachable tree entry
