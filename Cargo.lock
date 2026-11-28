@@ -63,7 +63,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "signet"
 version = "0.1.0"
-source = "git+https://github.com/jasonhadler25/signet?rev=5b5e445819ce06d899d76d3f16dd5f9b91cb6852#5b5e445819ce06d899d76d3f16dd5f9b91cb6852"
+source = "git+https://github.com/jasonhadler25/signet?rev=4736e18bd6d8eabdcf3ac88d89dbbb73aedd0d87#4736e18bd6d8eabdcf3ac88d89dbbb73aedd0d87"
 dependencies = [
  "blake3-servil-core",
  "constant_time_eq",
